@@ -7,7 +7,7 @@
 from collections import defaultdict
 import multiprocessing as mp
 #from concurrent import futures
-import time, atexit, sys
+import time, atexit, sys, ctypes
 
 from .simulus import *
 from .simulator import *
@@ -24,7 +24,7 @@ class sync(object):
 
     _simulus = None
     
-    def __init__(self, sims, enable_smp=False, enable_spmd=False, lookahead=infinite_time, smp_ways=None):
+    def __init__(self, sims, enable_smp=False, enable_spmd=False, lookahead=infinite_time, smp_ways=None, protocol='yawns'):
         """Create a synchronized group of multiple simulators. 
 
         Bring all simulators in the group to synchrony; that is, the
@@ -97,11 +97,21 @@ class sync(object):
             errmsg = "sync(smp_ways=%r) expects a positive integer" % smp_ways
             log.error(errmsg)
             raise ValueError(errmsg)
-        
+
+        if protocol not in ('yawns', 'soft_tm'):
+            errmsg = "sync(protocol=%r) expects 'yawns' or 'soft_tm'" % protocol
+            log.error(errmsg)
+            raise ValueError(errmsg)
+
         self._activated = False  # keep it false until we are done with creating the sync group
         self._smp = enable_smp
         self._smp_ways = smp_ways
         self._spmd = enable_spmd
+        self._protocol = protocol
+        # Soft-TM shared-memory state (allocated lazily in run() once we know
+        # the number of partitions / pids).
+        self._horizon_shm = None       # mp.RawArray (one slot per pid; per-pid local horizon)
+        self._horizon_barrier = None   # mp.Barrier(len(self._local_partitions))
         if self._spmd and not sync._simulus.args.mpi:
             errmsg = "sync(enable_spmd=True) requires MPI support (use --mpi or -x command-line option)"
             log.error(errmsg)
@@ -312,6 +322,17 @@ class sync(object):
                     except RuntimeError:
                         pass  # start method already set; assume fork or acceptable alternative
 
+                # Soft-TM Hook A: allocate shared-memory horizon array + barrier
+                # before fork so all children inherit the same backing memory.
+                # Layout: one slot per pid holding the pid's locally-computed
+                # horizon for the current iteration. Barrier (write-then-read)
+                # makes the shared-memory reduce equivalent to YAWNS allreduce
+                # but ~10x cheaper than the mp.Queue round-trip.
+                if self._protocol == 'soft_tm':
+                    n_pids = len(self._local_partitions)
+                    self._horizon_shm = mp.RawArray(ctypes.c_double, n_pids)
+                    self._horizon_barrier = mp.Barrier(n_pids)
+
                 # start the child processes
                 self._child_procs = [mp.Process(target=sync._child_run, args=(self, i)) \
                                      for i in range(1, len(self._local_partitions))]
@@ -411,22 +432,38 @@ class sync(object):
             if horizon > upper:
                 horizon = upper
 
-            # find the next window for all processes on all ranks
-            if len(self._local_partitions) > 1:
-                if pid > 0:
-                    self._local_queues[0].put(horizon)
-                else:
-                    for s in range(1, len(self._local_partitions)):
-                        x = self._local_queues[0].get()
-                        if x < horizon: horizon = x
-            if self._spmd and pid == 0:
-                horizon = sync._simulus.allreduce(horizon, min)
-            if len(self._local_partitions) > 1:
-                if pid > 0:
-                    horizon = self._local_queues[pid].get()
-                else:
-                    for s in range(1, len(self._local_partitions)):
-                        self._local_queues[s].put(horizon)
+            # Soft-TM Hook B: replace YAWNS mp.Queue allreduce with shared-memory
+            # barrier-reduce. Every pid writes its locally-computed horizon to its
+            # own slot; barrier syncs writers; each pid then reads all slots and
+            # takes the min; second barrier guarantees no pid overwrites its slot
+            # before all readers have read this iteration's value. SPMD path is
+            # unchanged (kept on the YAWNS branch).
+            if self._protocol == 'soft_tm' and len(self._local_partitions) > 1:
+                self._horizon_shm[pid] = horizon
+                self._horizon_barrier.wait()  # writers done
+                h = self._horizon_shm[0]
+                for i in range(1, len(self._local_partitions)):
+                    if self._horizon_shm[i] < h:
+                        h = self._horizon_shm[i]
+                horizon = h
+                self._horizon_barrier.wait()  # readers done
+            else:
+                # find the next window for all processes on all ranks (YAWNS)
+                if len(self._local_partitions) > 1:
+                    if pid > 0:
+                        self._local_queues[0].put(horizon)
+                    else:
+                        for s in range(1, len(self._local_partitions)):
+                            x = self._local_queues[0].get()
+                            if x < horizon: horizon = x
+                if self._spmd and pid == 0:
+                    horizon = sync._simulus.allreduce(horizon, min)
+                if len(self._local_partitions) > 1:
+                    if pid > 0:
+                        horizon = self._local_queues[pid].get()
+                    else:
+                        for s in range(1, len(self._local_partitions)):
+                            self._local_queues[s].put(horizon)
             #log.debug("[r%d] sync._run(pid='%d'): sync window [%g:%g]" %
             #          (sync._simulus.comm_rank, pid, self.now, horizon))
 
