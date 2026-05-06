@@ -147,6 +147,15 @@ class sync(object):
         self._channels = {}            # (src_name, mb_name) -> _Channel
         self._lp_inputs = defaultdict(list)   # lp_name -> list of (src_name, mb_name)
         self._lp_outputs = defaultdict(list)  # lp_name -> list of (src_name, mb_name)
+        # CMB transport: per-pid data queues + final-exit barrier + done-pid
+        # counter (allocated in run() before fork when SMP is enabled and
+        # protocol == 'cmb').
+        self._local_data_queues = None
+        self._cmb_done_barrier = None
+        self._cmb_done_count = None
+        # Per-worker pid context, set on entry to _smp_run_cmb so sync.send()
+        # (called from inside sim._run) knows which pid is dispatching.
+        self._cmb_my_pid = -1
         if self._spmd and not sync._simulus.args.mpi:
             errmsg = "sync(enable_spmd=True) requires MPI support (use --mpi or -x command-line option)"
             log.error(errmsg)
@@ -445,6 +454,21 @@ class sync(object):
                     self._horizon_shm = mp.RawArray(ctypes.c_double, n_pids)
                     self._horizon_barrier = mp.Barrier(n_pids)
 
+                # CMB asynchronous transport: per-pid data queues for nulls
+                # and real messages. Created before fork so children inherit
+                # the queue handles. _cmb_done_count tracks how many pids
+                # have finished advancing; a pid keeps draining incoming
+                # until all pids are done so no messages are stranded
+                # (this is the CMB analog of CTW's window-boundary
+                # collective distribution). Final barrier ensures clean exit.
+                if self._protocol == 'cmb':
+                    n_pids = len(self._local_partitions)
+                    self._local_data_queues = {
+                        i: mp.Queue() for i in range(n_pids)
+                    }
+                    self._cmb_done_count = mp.Value('i', 0)
+                    self._cmb_done_barrier = mp.Barrier(n_pids)
+
                 # start the child processes
                 self._child_procs = [mp.Process(target=sync._child_run, args=(self, i)) \
                                      for i in range(1, len(self._local_partitions))]
@@ -534,10 +558,221 @@ class sync(object):
             self._smp_run_lockstep(pid, upper, upper_specified)
 
     def _smp_run_cmb(self, pid, upper, upper_specified):
-        """CMB asynchronous run loop. Implemented in Stage 3."""
-        raise NotImplementedError(
-            "CMB protocol not yet implemented; "
-            "use protocol='ctw' or 'stm' for now")
+        """CMB asynchronous run loop.
+
+        Each worker process owns a subset of LPs and runs them
+        independently. An LP advances when the minimum of its input
+        channel fronts permits; after advancing it dispatches a null
+        message on each output channel carrying its new safe-time
+        guarantee. Real messages travel through the same per-channel
+        transport (one mp.Queue per pid) and update the destination
+        mailbox; channel fronts are updated only by null messages
+        (see _cmb_drain_one_message).
+
+        Termination: requires upper to be specified. Each LP marks itself
+        done on first reaching upper. When all LPs on this pid are done,
+        the pid hits a final mp.Barrier so all pids exit together.
+        """
+        import queue as _queue_mod  # for queue.Empty
+
+        log.info("[r%d] sync._smp_run_cmb(pid=%d): begins upper=%g, "
+                 "upper_specified=%r" %
+                 (sync._simulus.comm_rank, pid, upper, upper_specified))
+
+        if not upper_specified:
+            raise RuntimeError(
+                "CMB protocol requires sync.run(until=...) to be specified")
+
+        run_sims = self._local_partitions[pid]
+        self._cmb_my_pid = pid
+        self._queue_empty = _queue_mod.Empty
+        multi_pid = len(self._local_partitions) > 1
+
+        # pid 0 wakes the children with the run command (matches lockstep loop)
+        if pid == 0 and multi_pid:
+            for s in range(1, len(self._local_partitions)):
+                self._local_queues[s].put(0)               # run command
+                self._local_queues[s].put((upper, upper_specified))
+            # Initial messages dispatched via g.send() before g.run() landed in
+            # _remote_msgbuf (the legacy CTW buffer). Drain those into per-pid
+            # data queues so the CMB loop sees them. We use '<init>' as a
+            # sentinel src_name; the drain ignores src_name for REAL messages
+            # (channel fronts are only updated by NULL messages).
+            for _rank, msgs in self._remote_msgbuf.items():
+                for (until, mb_name, part, msg) in msgs:
+                    target_sname, _md, _np, _src = self._all_mboxes[mb_name]
+                    target_pid = self._local_pids.get(target_sname)
+                    if target_pid == 0:
+                        mb = self._local_mboxes[mb_name]
+                        mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+                    elif target_pid is not None:
+                        self._local_data_queues[target_pid].put(
+                            ('REAL', '<init>', mb_name, part, msg, until))
+                    # cross-rank case: Stage 4
+            self._remote_msgbuf.clear()
+            self._remote_future = infinite_time
+
+        # Termination tracking
+        upper_reached = {sname: False for sname in run_sims}
+
+        while not all(upper_reached.values()):
+            # Phase 1: drain incoming data queue (only meaningful in multi-pid).
+            if multi_pid:
+                self._cmb_drain_incoming(pid)
+
+            # Phase 2: try to advance each LP that's not yet done.
+            any_advanced = False
+            for sname in run_sims:
+                if upper_reached[sname]:
+                    continue
+                sim = self._local_sims[sname]
+
+                horizon = self._cmb_compute_horizon(sname, upper)
+                if horizon > sim.now:
+                    self._cmb_advance_lp(sname, horizon)
+                    any_advanced = True
+                    if sim.now >= upper:
+                        upper_reached[sname] = True
+                        # Final null dispatch already happened in _cmb_advance_lp.
+
+            # Block on incoming if we made no progress.
+            if not any_advanced and not all(upper_reached.values()):
+                if multi_pid:
+                    self._cmb_wait_for_incoming(pid)
+                else:
+                    # Single-process and no LP can advance: model has a
+                    # zero-aggregate-lookahead cycle, or upper is unreachable.
+                    # Either way, we cannot make progress.
+                    log.warning("[r%d] sync._smp_run_cmb(pid=%d): no LP can "
+                                "advance and no inter-pid IPC; aborting" %
+                                (sync._simulus.comm_rank, pid))
+                    break
+
+        # Termination phase: this pid is done advancing, but other pids may
+        # still be sending messages targeted at our LPs. Increment the done
+        # counter, then keep draining until all pids report done. This is
+        # the CMB analog of CTW's window-boundary collective distribution
+        # for the final window. Once all pids report done, no further sends
+        # are possible; we drain once more, then hit the final barrier so
+        # all pids exit together.
+        if multi_pid:
+            n_pids = len(self._local_partitions)
+            with self._cmb_done_count.get_lock():
+                self._cmb_done_count.value += 1
+            while self._cmb_done_count.value < n_pids:
+                self._cmb_drain_incoming(pid)
+                time.sleep(0.0001)  # avoid busy-spin
+            # Once all pids are done, drain any tail messages.
+            self._cmb_drain_incoming(pid)
+            self._cmb_done_barrier.wait()
+            # After barrier, drain one more time in case any straggler
+            # messages slipped in between drain and barrier release.
+            self._cmb_drain_incoming(pid)
+
+        self._cmb_my_pid = -1
+        log.info("[r%d] sync._smp_run_cmb(pid=%d): ends" %
+                 (sync._simulus.comm_rank, pid))
+
+    def _cmb_compute_horizon(self, sname, upper):
+        """Return the maximum time this LP can safely advance to:
+        min(channel.front for ch in inputs(sname)), bounded by upper."""
+        inputs = self._lp_inputs.get(sname, [])
+        if not inputs:
+            # No inputs -> may advance freely up to upper.
+            return upper
+        h = min(self._channels[ch_id].front for ch_id in inputs)
+        if h > upper:
+            h = upper
+        return h
+
+    def _cmb_advance_lp(self, sname, horizon):
+        """Advance LP sname to horizon, then dispatch nulls on each output
+        channel with the new safe-time guarantee."""
+        sim = self._local_sims[sname]
+
+        # Run the LP up to horizon; sim._run with True advances even when no
+        # event sits in the window. Real messages dispatched during the
+        # advance flow through self.send() -> _cmb_route_send.
+        sim._run(horizon, True)
+
+        # After advance: dispatch null on every output channel.
+        # No null elision in this version; an extra scalar per advance per
+        # output channel is acceptable for correctness validation.
+        for ch_id in self._lp_outputs.get(sname, []):
+            ch = self._channels[ch_id]
+            new_safe_time = sim.now + ch.min_delay
+            self._cmb_publish_safe_time(ch_id, new_safe_time)
+
+    def _cmb_publish_safe_time(self, ch_id, safe_time):
+        """Publish a new safe-time guarantee to the destination of ch_id.
+
+        Intra-pid: write directly to channel.front.
+        Inter-pid (same rank): enqueue NULL message on dst pid's data queue.
+        Inter-rank: deferred to Stage 4.
+        """
+        src_name, mb_name = ch_id
+        ch = self._channels[ch_id]
+        dst_pid = self._local_pids.get(ch.dst_name)
+        if dst_pid is None:
+            # Destination is on a different MPI rank; Stage 4 will MPI_Isend.
+            raise NotImplementedError(
+                "CMB SPMD (cross-rank) null dispatch not yet implemented")
+        if dst_pid == self._cmb_my_pid:
+            if safe_time > ch.front:
+                ch.front = safe_time
+        else:
+            self._local_data_queues[dst_pid].put(
+                ('NULL', src_name, mb_name, safe_time))
+
+    def _cmb_drain_incoming(self, pid):
+        """Non-blocking drain of this pid's data queue."""
+        q = self._local_data_queues[pid]
+        while True:
+            try:
+                msg = q.get_nowait()
+            except self._queue_empty:
+                break
+            self._cmb_drain_one_message(msg)
+
+    def _cmb_wait_for_incoming(self, pid):
+        """Block until at least one message arrives, then return."""
+        q = self._local_data_queues[pid]
+        msg = q.get()
+        self._cmb_drain_one_message(msg)
+
+    def _cmb_drain_one_message(self, msg):
+        """Process a single message from the data queue."""
+        kind = msg[0]
+        if kind == 'NULL':
+            _, src_name, mb_name, safe_time = msg
+            ch = self._channels.get((src_name, mb_name))
+            if ch is not None and safe_time > ch.front:
+                ch.front = safe_time
+        elif kind == 'REAL':
+            _, src_name, mb_name, part, payload, until = msg
+            mb = self._local_mboxes[mb_name]
+            mb._sim.sched(mb._mailbox_event, payload, part, until=until)
+        else:
+            raise RuntimeError("unknown CMB message kind: %r" % (kind,))
+
+    def _cmb_route_send(self, sim, mbox_name, msg, part, until):
+        """CMB-specific send routing, called from sync.send when
+        protocol == 'cmb'. Returns True if handled, False to fall through
+        to the legacy CTW send path."""
+        sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
+        target_pid = self._local_pids.get(sname)
+        if target_pid is None:
+            # Cross-rank — Stage 4 handles MPI.
+            raise NotImplementedError(
+                "CMB SPMD (cross-rank) real-message dispatch not yet implemented")
+        if target_pid == self._cmb_my_pid:
+            # Intra-pid: schedule directly on receiver's mailbox.
+            mb = self._local_mboxes[mbox_name]
+            mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+        else:
+            self._local_data_queues[target_pid].put(
+                ('REAL', sim.name, mbox_name, part, msg, until))
+        return True
 
     def _smp_run_lockstep(self, pid, upper, upper_specified):
         """Lockstep run loop, used by 'ctw' (YAWNS) and the current
@@ -756,6 +991,14 @@ class sync(object):
                          (part, mbox_name, nparts)
                 log.error(errmsg)
                 raise IndexError(errmsg)
+
+            # CMB asynchronous send: route through the per-pid data queue
+            # immediately, rather than buffering for window-boundary
+            # distribution as in CTW.
+            if self._protocol == 'cmb' and self._cmb_my_pid >= 0:
+                until = sim.now + delay
+                self._cmb_route_send(sim, mbox_name, msg, part, until)
+                return
 
             # if it's local delivery, send to the target mailbox
             # directly; a local delivery can be one of the two cases:
