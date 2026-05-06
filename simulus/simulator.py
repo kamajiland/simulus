@@ -772,7 +772,7 @@ class simulator:
 
         return Bucket(self, capacity, initlevel, name, p_qdis, c_qdis, collect)
 
-    def mailbox(self, name=None, min_delay=0, nparts=1, collect=None):
+    def mailbox(self, name=None, min_delay=0, nparts=1, collect=None, source=None):
         """Create and return a mailbox.
 
         Args:
@@ -821,7 +821,7 @@ class simulator:
             errmsg = "simulator.mailbox(name=%s) duplicate name" % name
             log.error(errmsg)
             raise ValueError(errmsg)
-        mb = Mailbox(self, nparts, min_delay, name, collect)
+        mb = Mailbox(self, nparts, min_delay, name, collect, source=source)
         if name is None:
             log.info("[r%d] simulator '%s' creating anonymous mailbox" %
                      (self._simulus.comm_rank, self.name))

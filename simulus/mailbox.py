@@ -138,16 +138,25 @@ class Mailbox(object):
 
     """
 
-    def __init__(self, sim, nparts, min_delay, name, dc):
+    def __init__(self, sim, nparts, min_delay, name, dc, source=None):
         """A mailbox should be created using simulator's mailbox() function. A
         mailbox has a number of compartments or partitions, a minimum
         delay, a name, and DataCollector instance for statistics
-        collection."""
+        collection.
+
+        The 'source' parameter is required for asynchronous synchronization
+        protocols (CMB and STM): it identifies which simulator(s) may send
+        to this mailbox, so the sync group can build the per-(source, mb)
+        channel graph used by the asynchronous protocols. It may be a single
+        simulator instance, a list of simulator instances, or None. None is
+        the legacy many-writer behavior accepted by the synchronous CTW
+        protocol; CMB and STM require an explicit declaration."""
 
         self._sim = sim
         self.nparts = nparts
         self.min_delay = min_delay
         self.name = name
+        self.source = source  # None | simulator | list/tuple of simulators
 
         if nparts > 1:
             if dc is None: dc = [None]*nparts

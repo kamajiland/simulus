@@ -319,12 +319,6 @@ class sync(object):
                               "in this sync group" % (mbname, src_name))
                     log.error(errmsg)
                     raise ValueError(errmsg)
-                # Skip self-loops: an LP doesn't need a synchronization
-                # channel with itself. A self-send still goes through the
-                # local mailbox machinery, but the source has no synchronization
-                # commitment to track for itself.
-                if src_name == dst_sname:
-                    continue
                 ch_id = (src_name, mbname)
                 ch = _Channel(src_name, dst_sname, mbname, min_delay)
                 # Initialize front to self.now + min_delay so that LPs can
@@ -440,7 +434,7 @@ class sync(object):
                 # horizon for the current iteration. Barrier (write-then-read)
                 # makes the shared-memory reduce equivalent to YAWNS allreduce
                 # but ~10x cheaper than the mp.Queue round-trip.
-                if self._protocol == 'stm':
+                if self._protocol == 'soft_tm':
                     n_pids = len(self._local_partitions)
                     self._horizon_shm = mp.RawArray(ctypes.c_double, n_pids)
                     self._horizon_barrier = mp.Barrier(n_pids)
@@ -550,7 +544,7 @@ class sync(object):
             # takes the min; second barrier guarantees no pid overwrites its slot
             # before all readers have read this iteration's value. SPMD path is
             # unchanged (kept on the YAWNS branch).
-            if self._protocol == 'stm' and len(self._local_partitions) > 1:
+            if self._protocol == 'soft_tm' and len(self._local_partitions) > 1:
                 self._horizon_shm[pid] = horizon
                 self._horizon_barrier.wait()  # writers done
                 h = self._horizon_shm[0]
