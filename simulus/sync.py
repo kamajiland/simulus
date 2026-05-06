@@ -516,8 +516,35 @@ class sync(object):
                 break
 
     def _smp_run(self, pid, upper, upper_specified):
-        """Run simulators in separate processes."""
-        
+        """Dispatch to the protocol-specific run loop.
+
+        Each protocol owns its own worker-process loop because the
+        synchronization mechanics differ fundamentally:
+          - 'ctw': YAWNS-style synchronous barrier reduce (lockstep)
+          - 'stm': lockstep-prototype variant of CTW with shared-memory reduce
+                   (will be replaced by non-lockstep per-channel STM in a
+                    later stage)
+          - 'cmb': fully asynchronous null-message protocol
+        """
+        if self._protocol == 'cmb':
+            self._smp_run_cmb(pid, upper, upper_specified)
+        else:
+            # ctw and stm both currently use the lockstep loop;
+            # the inner code branches on self._protocol for the reduce.
+            self._smp_run_lockstep(pid, upper, upper_specified)
+
+    def _smp_run_cmb(self, pid, upper, upper_specified):
+        """CMB asynchronous run loop. Implemented in Stage 3."""
+        raise NotImplementedError(
+            "CMB protocol not yet implemented; "
+            "use protocol='ctw' or 'stm' for now")
+
+    def _smp_run_lockstep(self, pid, upper, upper_specified):
+        """Lockstep run loop, used by 'ctw' (YAWNS) and the current
+        lockstep-STM prototype. The horizon-reduce step branches on
+        self._protocol: 'stm' uses a shared-memory barrier reduce while
+        'ctw' uses the original mp.Queue allreduce."""
+
         log.info("[r%d] sync._smp_run(pid=%d): begins with upper=%g, upper_specified=%r" %
                  (sync._simulus.comm_rank, pid, upper, upper_specified))
         run_sims = self._local_partitions[pid]
