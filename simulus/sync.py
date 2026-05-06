@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
 
+# MPI tags for CMB cross-rank transport. Distinct tags let the receiver
+# dispatch on type (null vs real) without unpacking the payload.
+_CMB_NULL_TAG = 4001
+_CMB_REAL_TAG = 4002
+
+
 class _Channel(object):
     """A directed channel from a source LP to a destination mailbox.
 
@@ -586,7 +592,9 @@ class sync(object):
         run_sims = self._local_partitions[pid]
         self._cmb_my_pid = pid
         self._queue_empty = _queue_mod.Empty
+        self._cmb_pending_sends = []
         multi_pid = len(self._local_partitions) > 1
+        multi_rank = self._spmd and sync._simulus.comm_size > 1
 
         # pid 0 wakes the children with the run command (matches lockstep loop)
         if pid == 0 and multi_pid:
@@ -595,9 +603,9 @@ class sync(object):
                 self._local_queues[s].put((upper, upper_specified))
             # Initial messages dispatched via g.send() before g.run() landed in
             # _remote_msgbuf (the legacy CTW buffer). Drain those into per-pid
-            # data queues so the CMB loop sees them. We use '<init>' as a
-            # sentinel src_name; the drain ignores src_name for REAL messages
-            # (channel fronts are only updated by NULL messages).
+            # data queues (intra-rank) or via MPI isend (cross-rank). We use
+            # '<init>' as a sentinel src_name; the drain ignores src_name for
+            # REAL messages (channel fronts are only updated by NULL messages).
             for _rank, msgs in self._remote_msgbuf.items():
                 for (until, mb_name, part, msg) in msgs:
                     target_sname, _md, _np, _src = self._all_mboxes[mb_name]
@@ -608,17 +616,34 @@ class sync(object):
                     elif target_pid is not None:
                         self._local_data_queues[target_pid].put(
                             ('REAL', '<init>', mb_name, part, msg, until))
-                    # cross-rank case: Stage 4
+                    else:
+                        # Cross-rank initial send (only meaningful in SPMD).
+                        target_rank = self._all_sims[target_sname]
+                        self._cmb_mpi_isend_real(
+                            target_rank, '<init>', mb_name, part, msg, until)
             self._remote_msgbuf.clear()
             self._remote_future = infinite_time
 
         # Termination tracking
         upper_reached = {sname: False for sname in run_sims}
 
+        # pid 0 maintains the MPI drain cadence: every K iterations of the
+        # main loop, prune completed isends so the request list does not grow.
+        prune_counter = 0
+
         while not all(upper_reached.values()):
-            # Phase 1: drain incoming data queue (only meaningful in multi-pid).
+            # Phase 1: drain incoming.
+            #   - intra-rank: every pid drains its own mp.Queue
+            #   - inter-rank: only pid 0 polls MPI; messages are forwarded
+            #     to the appropriate local pid's mp.Queue if not for pid 0
             if multi_pid:
                 self._cmb_drain_incoming(pid)
+            if multi_rank and pid == 0:
+                self._cmb_mpi_drain()
+                prune_counter += 1
+                if prune_counter >= 64:
+                    self._cmb_mpi_prune_pending()
+                    prune_counter = 0
 
             # Phase 2: try to advance each LP that's not yet done.
             any_advanced = False
@@ -637,36 +662,99 @@ class sync(object):
 
             # Block on incoming if we made no progress.
             if not any_advanced and not all(upper_reached.values()):
-                if multi_pid:
+                if multi_pid and not (multi_rank and pid == 0):
+                    # Non-pid-0 workers (or pid 0 in non-MPI runs) can block
+                    # on the mp.Queue. pid 0 in MPI mode must keep polling
+                    # MPI so we sleep briefly instead.
                     self._cmb_wait_for_incoming(pid)
+                elif multi_rank and pid == 0:
+                    # pid 0 in MPI mode: can't block on mp.Queue (would
+                    # starve MPI polling). Tiny sleep + continue loop.
+                    time.sleep(0.0001)
                 else:
-                    # Single-process and no LP can advance: model has a
-                    # zero-aggregate-lookahead cycle, or upper is unreachable.
-                    # Either way, we cannot make progress.
+                    # Single-process, no IPC, no progress: zero-aggregate-
+                    # lookahead cycle or upper unreachable.
                     log.warning("[r%d] sync._smp_run_cmb(pid=%d): no LP can "
-                                "advance and no inter-pid IPC; aborting" %
+                                "advance and no inter-pid/inter-rank IPC; "
+                                "aborting" %
                                 (sync._simulus.comm_rank, pid))
                     break
 
-        # Termination phase: this pid is done advancing, but other pids may
-        # still be sending messages targeted at our LPs. Increment the done
-        # counter, then keep draining until all pids report done. This is
-        # the CMB analog of CTW's window-boundary collective distribution
-        # for the final window. Once all pids report done, no further sends
-        # are possible; we drain once more, then hit the final barrier so
-        # all pids exit together.
+        # Termination phase. Three kinds of in-flight messages can still
+        # be in motion:
+        #   (a) intra-pid scheduled events — already handled, those LPs
+        #       reached upper_reached[sname]
+        #   (b) intra-rank queued messages — drain via _cmb_done_count
+        #   (c) inter-rank MPI messages — coordinated via Iallreduce + final
+        #       MPI_Barrier on pid 0
+
+        # First: intra-rank done counter. Each pid bumps the counter once
+        # its local LPs are all done; everyone keeps draining their mp.Queue
+        # until the counter reaches n_pids_local.
         if multi_pid:
-            n_pids = len(self._local_partitions)
+            n_pids_local = len(self._local_partitions)
             with self._cmb_done_count.get_lock():
                 self._cmb_done_count.value += 1
-            while self._cmb_done_count.value < n_pids:
+            while self._cmb_done_count.value < n_pids_local:
                 self._cmb_drain_incoming(pid)
-                time.sleep(0.0001)  # avoid busy-spin
-            # Once all pids are done, drain any tail messages.
+                if multi_rank and pid == 0:
+                    self._cmb_mpi_drain()
+                time.sleep(0.0001)
+            # All local pids signaled done. Drain residual mp.Queue traffic.
             self._cmb_drain_incoming(pid)
+            if multi_rank and pid == 0:
+                self._cmb_mpi_drain()
+
+        # Second: cross-rank Iallreduce so all ranks know "everyone done".
+        # Only pid 0 of each rank participates in MPI. Non-pid-0 workers
+        # keep draining their mp.Queue until pid 0 sends a GLOBAL_DONE
+        # signal — pid 0 may forward MPI-incoming messages to those queues
+        # right up until it issues GLOBAL_DONE.
+        if multi_rank:
+            from mpi4py import MPI
+            if pid == 0:
+                local_done = bytearray([1])
+                global_done = bytearray([1])
+                req = MPI.COMM_WORLD.Iallreduce(
+                    [local_done, MPI.BYTE],
+                    [global_done, MPI.BYTE],
+                    op=MPI.MIN)
+                while not req.Test():
+                    self._cmb_mpi_drain()
+                    if multi_pid:
+                        self._cmb_drain_incoming(pid)
+                    time.sleep(0.0001)
+                # Tail-drain MPI a few times to catch any final messages
+                # that arrived after Iallreduce completed.
+                for _ in range(8):
+                    self._cmb_mpi_drain()
+                    time.sleep(0.0001)
+                # MPI barrier so no rank exits while another is still draining.
+                MPI.COMM_WORLD.Barrier()
+                self._cmb_mpi_drain()
+                if self._cmb_pending_sends:
+                    MPI.Request.Waitall(self._cmb_pending_sends)
+                    self._cmb_pending_sends = []
+                # Now signal non-pid-0 workers that global termination is done.
+                if multi_pid:
+                    for q_pid in range(1, len(self._local_partitions)):
+                        self._local_data_queues[q_pid].put(('GLOBAL_DONE',))
+            else:
+                # Non-pid-0 in multi-rank: keep draining mp.Queue until
+                # GLOBAL_DONE arrives. pid 0 forwards MPI traffic to our
+                # queue throughout the Iallreduce + Barrier window.
+                while True:
+                    try:
+                        msg = self._local_data_queues[pid].get(timeout=0.001)
+                    except self._queue_empty:
+                        continue
+                    if msg[0] == 'GLOBAL_DONE':
+                        break
+                    self._cmb_drain_one_message(msg)
+
+        # Final intra-rank barrier so all pids exit together.
+        if multi_pid:
             self._cmb_done_barrier.wait()
-            # After barrier, drain one more time in case any straggler
-            # messages slipped in between drain and barrier release.
             self._cmb_drain_incoming(pid)
 
         self._cmb_my_pid = -1
@@ -707,16 +795,22 @@ class sync(object):
         """Publish a new safe-time guarantee to the destination of ch_id.
 
         Intra-pid: write directly to channel.front.
-        Inter-pid (same rank): enqueue NULL message on dst pid's data queue.
-        Inter-rank: deferred to Stage 4.
+        Inter-pid (same rank): enqueue NULL on dst pid's data queue.
+        Inter-rank: pid 0 issues MPI isend; other pids forward to pid 0
+                    via the MPI_OUT_NULL trampoline.
         """
         src_name, mb_name = ch_id
         ch = self._channels[ch_id]
         dst_pid = self._local_pids.get(ch.dst_name)
         if dst_pid is None:
-            # Destination is on a different MPI rank; Stage 4 will MPI_Isend.
-            raise NotImplementedError(
-                "CMB SPMD (cross-rank) null dispatch not yet implemented")
+            # Destination is on a different MPI rank.
+            target_rank = self._all_sims[ch.dst_name]
+            if self._cmb_my_pid == 0:
+                self._cmb_mpi_isend_null(target_rank, src_name, mb_name, safe_time)
+            else:
+                self._local_data_queues[0].put(
+                    ('MPI_OUT_NULL', target_rank, src_name, mb_name, safe_time))
+            return
         if dst_pid == self._cmb_my_pid:
             if safe_time > ch.front:
                 ch.front = safe_time
@@ -741,7 +835,12 @@ class sync(object):
         self._cmb_drain_one_message(msg)
 
     def _cmb_drain_one_message(self, msg):
-        """Process a single message from the data queue."""
+        """Process a single message from the data queue.
+
+        NULL/REAL messages target a local LP; MPI_OUT_* messages are
+        cross-rank send requests that non-pid-0 workers forward to pid 0
+        via the queue (only pid 0 may call MPI in the SPMD layout).
+        """
         kind = msg[0]
         if kind == 'NULL':
             _, src_name, mb_name, safe_time = msg
@@ -752,21 +851,118 @@ class sync(object):
             _, src_name, mb_name, part, payload, until = msg
             mb = self._local_mboxes[mb_name]
             mb._sim.sched(mb._mailbox_event, payload, part, until=until)
+        elif kind == 'MPI_OUT_NULL':
+            _, target_rank, src_name, mb_name, safe_time = msg
+            self._cmb_mpi_isend_null(target_rank, src_name, mb_name, safe_time)
+        elif kind == 'MPI_OUT_REAL':
+            _, target_rank, src_name, mb_name, part, payload, until = msg
+            self._cmb_mpi_isend_real(
+                target_rank, src_name, mb_name, part, payload, until)
+        elif kind == 'GLOBAL_DONE':
+            # Sent by pid 0 to non-pid-0 workers in multi-rank termination.
+            # Non-pid-0 workers see this and know they can stop draining;
+            # the final intra-rank barrier handles the actual rendezvous.
+            pass
         else:
             raise RuntimeError("unknown CMB message kind: %r" % (kind,))
+
+    # ---------- MPI transport (pid 0 only) ----------
+
+    def _cmb_mpi_isend_null(self, target_rank, src_name, mb_name, safe_time):
+        """Non-blocking MPI send of a NULL message. Queues the request for
+        later pruning."""
+        from mpi4py import MPI
+        payload = (src_name, mb_name, safe_time)
+        req = MPI.COMM_WORLD.isend(
+            payload, dest=target_rank, tag=_CMB_NULL_TAG)
+        self._cmb_pending_sends.append(req)
+
+    def _cmb_mpi_isend_real(self, target_rank, src_name, mb_name,
+                             part, msg, until):
+        """Non-blocking MPI send of a REAL message."""
+        from mpi4py import MPI
+        payload = (src_name, mb_name, part, msg, until)
+        req = MPI.COMM_WORLD.isend(
+            payload, dest=target_rank, tag=_CMB_REAL_TAG)
+        self._cmb_pending_sends.append(req)
+
+    def _cmb_mpi_prune_pending(self):
+        """Remove completed isend requests so the list does not grow without
+        bound. Called periodically by pid 0."""
+        if not self._cmb_pending_sends:
+            return
+        self._cmb_pending_sends = [
+            r for r in self._cmb_pending_sends if not r.Test()
+        ]
+
+    def _cmb_mpi_drain(self):
+        """pid 0 only: drain all pending incoming MPI messages, routing
+        NULL/REAL to the appropriate local pid (or applying directly if
+        the destination LP is on pid 0). Non-blocking; returns when no
+        more incoming messages are pending."""
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        status = MPI.Status()
+        while comm.iprobe(source=MPI.ANY_SOURCE,
+                          tag=MPI.ANY_TAG,
+                          status=status):
+            tag = status.Get_tag()
+            source = status.Get_source()
+            if tag == _CMB_NULL_TAG:
+                payload = comm.recv(source=source, tag=tag)
+                src_name, mb_name, safe_time = payload
+                target_sname = self._all_mboxes[mb_name][0]
+                target_pid = self._local_pids.get(target_sname)
+                if target_pid == 0:
+                    ch = self._channels.get((src_name, mb_name))
+                    if ch is not None and safe_time > ch.front:
+                        ch.front = safe_time
+                elif target_pid is not None:
+                    self._local_data_queues[target_pid].put(
+                        ('NULL', src_name, mb_name, safe_time))
+                # If target_pid is None we received a stray; drop it.
+            elif tag == _CMB_REAL_TAG:
+                payload = comm.recv(source=source, tag=tag)
+                src_name, mb_name, part, msg, until = payload
+                target_sname = self._all_mboxes[mb_name][0]
+                target_pid = self._local_pids.get(target_sname)
+                if target_pid == 0:
+                    mb = self._local_mboxes[mb_name]
+                    mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+                elif target_pid is not None:
+                    self._local_data_queues[target_pid].put(
+                        ('REAL', src_name, mb_name, part, msg, until))
+            else:
+                # Unknown tag — drain via recv to keep buffer clean.
+                comm.recv(source=source, tag=tag)
+                log.warning("[r%d] CMB: unknown MPI tag %d, dropped" %
+                            (sync._simulus.comm_rank, tag))
 
     def _cmb_route_send(self, sim, mbox_name, msg, part, until):
         """CMB-specific send routing, called from sync.send when
         protocol == 'cmb'. Returns True if handled, False to fall through
-        to the legacy CTW send path."""
+        to the legacy CTW send path.
+
+        Routing tiers:
+          intra-pid: schedule directly on receiver's mailbox
+          inter-pid (same rank): mp.Queue on target pid
+          inter-rank: pid 0 issues MPI isend; other pids forward via
+                      the MPI_OUT_REAL trampoline on pid 0's queue
+        """
         sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
         target_pid = self._local_pids.get(sname)
         if target_pid is None:
-            # Cross-rank — Stage 4 handles MPI.
-            raise NotImplementedError(
-                "CMB SPMD (cross-rank) real-message dispatch not yet implemented")
+            # Cross-rank.
+            target_rank = self._all_sims[sname]
+            if self._cmb_my_pid == 0:
+                self._cmb_mpi_isend_real(
+                    target_rank, sim.name, mbox_name, part, msg, until)
+            else:
+                self._local_data_queues[0].put(
+                    ('MPI_OUT_REAL', target_rank, sim.name, mbox_name,
+                     part, msg, until))
+            return True
         if target_pid == self._cmb_my_pid:
-            # Intra-pid: schedule directly on receiver's mailbox.
             mb = self._local_mboxes[mbox_name]
             mb._sim.sched(mb._mailbox_event, msg, part, until=until)
         else:
