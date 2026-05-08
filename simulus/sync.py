@@ -168,6 +168,13 @@ class sync(object):
         # STM shared-memory channel-timestamp array (the ts[] of the
         # paper). One double per channel; populated in _build_channel_graph.
         self._channel_ts = None
+        # Per-advance min-until tracker. Reset by _cmb_advance_lp /
+        # _stm_advance_lp before sim._run; updated by _cmb_route_send /
+        # _stm_route_send during sim._run; read at publish time to cap
+        # safe_time at the smallest until of messages sent on this
+        # channel in this advance. Prevents free-advance past sent
+        # messages from publishing a safe_time higher than they allow.
+        self._advance_min_until = None
         if self._spmd and not sync._simulus.args.mpi:
             errmsg = "sync(enable_spmd=True) requires MPI support (use --mpi or -x command-line option)"
             log.error(errmsg)
@@ -610,23 +617,15 @@ class sync(object):
         multi_pid = len(self._local_partitions) > 1
         multi_rank = self._spmd and sync._simulus.comm_size > 1
 
-        # pid 0 wakes the children with the run command (matches lockstep loop)
-        if pid == 0 and multi_pid:
-            for s in range(1, len(self._local_partitions)):
-                self._local_queues[s].put(0)               # run command
-                self._local_queues[s].put((upper, upper_specified))
-
-        # Drain initial messages dispatched via g.send() before g.run().
-        # They landed in _remote_msgbuf (the legacy CTW buffer); we route
-        # each into the CMB transport: a local LP gets sched() directly,
-        # an LP on another local pid gets a REAL on its data queue, an LP
-        # on another rank gets an MPI isend. '<init>' is a sentinel
-        # src_name; REAL drain ignores src_name (channel fronts move only
-        # via NULL).
-        # Must run for any pid==0, including the multi_pid==False (one
-        # pid per rank, SPMD-only) case --- otherwise initial cross-rank
-        # messages stay buffered in _remote_msgbuf forever and the
-        # downstream LPs starve.
+        # Bootstrap order matters: drain initial messages from
+        # _remote_msgbuf BEFORE signaling children to start. Otherwise a
+        # child can enter its main loop, advance past the time of an
+        # initial event before pid 0 has pushed it, then sched-in-the-
+        # past when the late-arriving REAL is finally drained.
+        # The drain must run for any pid==0, including multi_pid==False
+        # (single pid per rank, SPMD-only); otherwise initial cross-rank
+        # messages stay buffered in _remote_msgbuf forever and downstream
+        # LPs starve.
         if pid == 0:
             for _rank, msgs in self._remote_msgbuf.items():
                 for (until, mb_name, part, msg) in msgs:
@@ -645,6 +644,12 @@ class sync(object):
                             target_rank, '<init>', mb_name, part, msg, until)
             self._remote_msgbuf.clear()
             self._remote_future = infinite_time
+
+        # Now signal children to start their main loops.
+        if pid == 0 and multi_pid:
+            for s in range(1, len(self._local_partitions)):
+                self._local_queues[s].put(0)               # run command
+                self._local_queues[s].put((upper, upper_specified))
 
         # Termination tracking
         upper_reached = {sname: False for sname in run_sims}
@@ -797,21 +802,34 @@ class sync(object):
 
     def _cmb_advance_lp(self, sname, horizon):
         """Advance LP sname to horizon, then dispatch nulls on each output
-        channel with the new safe-time guarantee."""
-        sim = self._local_sims[sname]
+        channel with the new safe-time guarantee.
 
-        # Run the LP up to horizon; sim._run with True advances even when no
-        # event sits in the window. Real messages dispatched during the
-        # advance flow through self.send() -> _cmb_route_send.
+        Correctness subtlety: when sim._run free-advances past the time
+        of a just-sent message (no further event prevents it from
+        running to horizon), the published safe_time = sim.now +
+        min_delay can exceed the smallest until of messages already
+        sent in this advance. The destination would then see the
+        higher safe_time first, advance past the in-flight real, and
+        sched-in-the-past on receipt. We track the per-output-channel
+        minimum of sent untils during the advance and cap the publish
+        at it. (All-to-all PHOLD masks this bug because high event
+        density keeps sim.now close to event times; sparse topologies
+        like ring or chain expose it.)
+        """
+        sim = self._local_sims[sname]
+        # Reset per-advance bookkeeping. _cmb_route_send updates entries
+        # via the _advance_min_until dict during sim._run.
+        self._advance_min_until = {}
         sim._run(horizon, True)
 
-        # After advance: dispatch null on every output channel.
-        # No null elision in this version; an extra scalar per advance per
-        # output channel is acceptable for correctness validation.
         for ch_id in self._lp_outputs.get(sname, []):
             ch = self._channels[ch_id]
             new_safe_time = sim.now + ch.min_delay
+            sent_min = self._advance_min_until.get(ch_id)
+            if sent_min is not None and sent_min < new_safe_time:
+                new_safe_time = sent_min
             self._cmb_publish_safe_time(ch_id, new_safe_time)
+        self._advance_min_until = None
 
     def _cmb_publish_safe_time(self, ch_id, safe_time):
         """Publish a new safe-time guarantee to the destination of ch_id.
@@ -965,12 +983,20 @@ class sync(object):
         protocol == 'cmb'. Returns True if handled, False to fall through
         to the legacy CTW send path.
 
-        Routing tiers:
-          intra-pid: schedule directly on receiver's mailbox
-          inter-pid (same rank): mp.Queue on target pid
-          inter-rank: pid 0 issues MPI isend; other pids forward via
-                      the MPI_OUT_REAL trampoline on pid 0's queue
+        Also records the per-channel minimum until of all messages sent
+        in this advance, so _cmb_advance_lp can cap the published
+        safe_time at that minimum (otherwise free-advance past the
+        message's send time produces a publish > some sent until,
+        which lets the destination advance past in-flight reals).
+        Self-sends have no synchronization channel (build_channel_graph
+        skips src == dst), so the dict update is guarded by the
+        channel registry.
         """
+        ch_id = (sim.name, mbox_name)
+        if ch_id in self._channels:
+            cur = self._advance_min_until.get(ch_id)
+            if cur is None or until < cur:
+                self._advance_min_until[ch_id] = until
         sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
         target_pid = self._local_pids.get(sname)
         if target_pid is None:
@@ -1037,15 +1063,11 @@ class sync(object):
         multi_pid = len(self._local_partitions) > 1
         multi_rank = self._spmd and sync._simulus.comm_size > 1
 
-        # pid 0 wakes the children with the run command (matches CMB / lockstep).
-        if pid == 0 and multi_pid:
-            for s in range(1, len(self._local_partitions)):
-                self._local_queues[s].put(0)               # run command
-                self._local_queues[s].put((upper, upper_specified))
-
-        # Drain initial messages from _remote_msgbuf. See _smp_run_cmb
-        # for rationale; same single-pid (multi_pid==False) case must
-        # run too. With multi_rank, cross-rank initial sends fire MPI.
+        # Drain initial messages from _remote_msgbuf BEFORE signaling
+        # children to start (same race fix as _smp_run_cmb): otherwise
+        # a child can advance past an initial event before pid 0 has
+        # pushed it. The drain must run for any pid==0 (including
+        # multi_pid==False, single pid per rank).
         if pid == 0:
             for _rank, msgs in self._remote_msgbuf.items():
                 for (until, mb_name, part, msg) in msgs:
@@ -1063,6 +1085,12 @@ class sync(object):
                             target_rank, '<init>', mb_name, part, msg, until)
             self._remote_msgbuf.clear()
             self._remote_future = infinite_time
+
+        # Now signal children to start their main loops.
+        if pid == 0 and multi_pid:
+            for s in range(1, len(self._local_partitions)):
+                self._local_queues[s].put(0)               # run command
+                self._local_queues[s].put((upper, upper_specified))
 
         upper_reached = {sname: False for sname in run_sims}
         prune_counter = 0
@@ -1193,21 +1221,32 @@ class sync(object):
         """Advance LP sname to horizon; then publish new safe times on
         each output channel.
 
-        Correctness via queue ordering: REAL messages on this source's
-        outputs were enqueued during sim._run on each destination pid's
-        data queue (intra-rank) or via MPI isend (inter-rank). The
-        TS_UPDATE follows REAL on the same FIFO transport, so a
-        destination drains REALs first (and sched succeeds: their until
-        is at least the source's old front), then raises the channel's
-        front via TS_UPDATE.
+        Correctness has two parts. (a) Queue ordering: REAL messages on
+        this source's outputs were enqueued during sim._run on each
+        destination pid's data queue (intra-rank) or via MPI isend
+        (inter-rank). The TS_UPDATE follows REAL on the same FIFO
+        transport, so a destination drains REALs first then raises the
+        front via TS_UPDATE. (b) Cap on publish: if sim._run free-
+        advances past the time of a just-sent message, the
+        sim.now-based publish can exceed the smallest until of sent
+        messages on that channel. The destination would then see the
+        higher safe_time, advance past the in-flight real, and
+        sched-in-the-past on receipt. We track per-channel min_until
+        during the advance (via _advance_min_until in _stm_route_send)
+        and cap the publish at it.
         """
         sim = self._local_sims[sname]
+        self._advance_min_until = {}
         sim._run(horizon, True)
         end_now = sim.now
         for ch_id in self._lp_outputs.get(sname, []):
             ch = self._channels[ch_id]
             new_safe = end_now + ch.min_delay
+            sent_min = self._advance_min_until.get(ch_id)
+            if sent_min is not None and sent_min < new_safe:
+                new_safe = sent_min
             self._stm_publish_safe_time(ch_id, new_safe)
+        self._advance_min_until = None
 
     def _stm_publish_safe_time(self, ch_id, safe_time):
         """Publish a new safe-time guarantee to the destination of ch_id.
@@ -1377,6 +1416,13 @@ class sync(object):
     def _stm_route_send(self, sim, mbox_name, msg, part, until):
         """STM-specific send routing. Mirrors _cmb_route_send.
 
+        Also records the per-channel min until in _advance_min_until,
+        so _stm_advance_lp can cap the published safe_time at the
+        minimum of any messages sent in this advance --- preventing
+        free-advance past the message time from publishing a safe_time
+        higher than the message's own until. (Same correctness fix as
+        in _cmb_route_send.)
+
         Routing tiers:
           intra-pid: schedule directly on receiver's mailbox
           inter-pid (same rank): mp.Queue on target pid (FIFO with the
@@ -1384,6 +1430,11 @@ class sync(object):
           inter-rank: pid 0 issues MPI isend; other pids forward via
                       the MPI_OUT_REAL trampoline on pid 0's queue
         """
+        ch_id = (sim.name, mbox_name)
+        if ch_id in self._channels:
+            cur = self._advance_min_until.get(ch_id)
+            if cur is None or until < cur:
+                self._advance_min_until[ch_id] = until
         sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
         target_pid = self._local_pids.get(sname)
         if target_pid is None:
