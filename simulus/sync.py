@@ -19,10 +19,14 @@ log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
 
-# MPI tags for CMB cross-rank transport. Distinct tags let the receiver
-# dispatch on type (null vs real) without unpacking the payload.
+# MPI tags for cross-rank transport. Distinct tags let the receiver
+# dispatch on type without unpacking the payload. CMB uses NULL+REAL;
+# STM uses TS_UPDATE+REAL. The tags are protocol-specific (CMB and STM
+# never run simultaneously, but distinct tags keep diagnostics clean).
 _CMB_NULL_TAG = 4001
 _CMB_REAL_TAG = 4002
+_STM_TS_TAG   = 4003
+_STM_REAL_TAG = 4004
 
 
 class _Channel(object):
@@ -1006,11 +1010,15 @@ class sync(object):
     def _smp_run_stm(self, pid, upper, upper_specified):
         """STM asynchronous channel-scanning run loop.
 
-        Same termination structure as _smp_run_cmb (intra-rank done counter
-        + barrier). The Phase 2 advance check reads shared-memory ts[]
-        slots instead of channel.front; lookahead update writes ts[] after
-        advance. No NULL messages --- timestamp updates are
-        memory-visible to all readers as soon as written.
+        Mirrors _smp_run_cmb in structure (intra-rank drain + try-advance
+        + done counter + barrier; multi-rank Iallreduce + GLOBAL_DONE).
+        The protocol differences are isolated to the helpers:
+        _stm_compute_horizon reads input fronts; _stm_publish_safe_time
+        publishes via TS_UPDATE on the FIFO transport (intra-rank
+        mp.Queue or inter-rank MPI on _STM_TS_TAG). REAL messages share
+        the same transport ordering, so any TS_UPDATE on a channel
+        arrives at the destination AFTER all REALs sent on that channel
+        in the same advance.
         """
         import queue as _queue_mod
 
@@ -1021,15 +1029,13 @@ class sync(object):
         if not upper_specified:
             raise RuntimeError(
                 "STM protocol requires sync.run(until=...) to be specified")
-        if self._spmd and sync._simulus.comm_size > 1:
-            raise NotImplementedError(
-                "STM under enable_spmd is not implemented in this stage; "
-                "use enable_smp only or run with mpiexec -n 1")
 
         run_sims = self._local_partitions[pid]
         self._stm_my_pid = pid
         self._queue_empty = _queue_mod.Empty
+        self._stm_pending_sends = []
         multi_pid = len(self._local_partitions) > 1
+        multi_rank = self._spmd and sync._simulus.comm_size > 1
 
         # pid 0 wakes the children with the run command (matches CMB / lockstep).
         if pid == 0 and multi_pid:
@@ -1037,9 +1043,9 @@ class sync(object):
                 self._local_queues[s].put(0)               # run command
                 self._local_queues[s].put((upper, upper_specified))
 
-        # Drain initial messages from _remote_msgbuf the same way CMB does.
-        # See _smp_run_cmb for rationale; same single-pid (multi_pid==False)
-        # case must run too.
+        # Drain initial messages from _remote_msgbuf. See _smp_run_cmb
+        # for rationale; same single-pid (multi_pid==False) case must
+        # run too. With multi_rank, cross-rank initial sends fire MPI.
         if pid == 0:
             for _rank, msgs in self._remote_msgbuf.items():
                 for (until, mb_name, part, msg) in msgs:
@@ -1051,16 +1057,26 @@ class sync(object):
                     elif target_pid is not None:
                         self._local_data_queues[target_pid].put(
                             ('REAL', '<init>', mb_name, part, msg, until))
-                    # No cross-rank path here: SPMD-STM is unimplemented.
+                    else:
+                        target_rank = self._all_sims[target_sname]
+                        self._stm_mpi_isend_real(
+                            target_rank, '<init>', mb_name, part, msg, until)
             self._remote_msgbuf.clear()
             self._remote_future = infinite_time
 
         upper_reached = {sname: False for sname in run_sims}
+        prune_counter = 0
 
         while not all(upper_reached.values()):
-            # Phase 1: drain incoming REAL messages from this pid's queue.
+            # Phase 1: drain incoming.
             if multi_pid:
                 self._stm_drain_incoming(pid)
+            if multi_rank and pid == 0:
+                self._stm_mpi_drain()
+                prune_counter += 1
+                if prune_counter >= 64:
+                    self._stm_mpi_prune_pending()
+                    prune_counter = 0
 
             # Phase 2: try to advance each LP not yet done.
             any_advanced = False
@@ -1075,38 +1091,82 @@ class sync(object):
                     if sim.now >= upper:
                         upper_reached[sname] = True
 
-            # No LP advanced this round. Unlike CMB, STM cannot block on
-            # the data queue here: ts[] updates happen via shared memory
-            # without enqueueing anything, so a blocked q.get() would
-            # never see them and we'd deadlock. The paper's `retry`
-            # semantics map naturally to a short polling sleep --- the
-            # next iteration re-reads ts[] (cheap) and either advances
-            # or sleeps again. Cost is bounded by the sleep interval.
+            # Phase 3: no LP advanced this round. STM cannot block on
+            # the data queue (a blocked q.get() would miss intra-pid
+            # publishes that go through _channel_ts directly), so we
+            # poll on a short sleep --- the paper's `retry` semantics
+            # under mp.Queue + RawArray. Cost bounded by sleep interval.
             if not any_advanced and not all(upper_reached.values()):
-                if multi_pid:
-                    # Brief sleep keeps us responsive to remote ts writes
-                    # while bounding CPU cost. 100us is well below the
-                    # microbenchmark advance-check cost on most hardware.
+                if multi_pid or multi_rank:
                     time.sleep(0.0001)
                 else:
-                    # Single-pid, no IPC: zero-aggregate-lookahead cycle
-                    # or upper unreachable. The paper's "deadlock ->
-                    # livelock" failure mode for STM; we exit here to
-                    # avoid spinning forever.
                     log.warning("[r%d] sync._smp_run_stm(pid=%d): no LP can "
-                                "advance and no inter-pid IPC; aborting" %
+                                "advance and no inter-pid/inter-rank IPC; "
+                                "aborting" %
                                 (sync._simulus.comm_rank, pid))
                     break
 
-        # Termination: same intra-rank done counter + barrier as CMB.
+        # Termination phase. Three kinds of in-flight messages can still
+        # be in motion (mirroring CMB Stage 4):
+        #   (a) intra-pid scheduled events --- already handled
+        #   (b) intra-rank queued messages --- drain via _cmb_done_count
+        #   (c) inter-rank MPI messages --- Iallreduce + Barrier + GLOBAL_DONE
+
+        # First: intra-rank done counter.
         if multi_pid:
             n_pids_local = len(self._local_partitions)
             with self._cmb_done_count.get_lock():
                 self._cmb_done_count.value += 1
             while self._cmb_done_count.value < n_pids_local:
                 self._stm_drain_incoming(pid)
+                if multi_rank and pid == 0:
+                    self._stm_mpi_drain()
                 time.sleep(0.0001)
             self._stm_drain_incoming(pid)
+            if multi_rank and pid == 0:
+                self._stm_mpi_drain()
+
+        # Second: cross-rank Iallreduce.
+        if multi_rank:
+            from mpi4py import MPI
+            if pid == 0:
+                local_done = bytearray([1])
+                global_done = bytearray([1])
+                req = MPI.COMM_WORLD.Iallreduce(
+                    [local_done, MPI.BYTE],
+                    [global_done, MPI.BYTE],
+                    op=MPI.MIN)
+                while not req.Test():
+                    self._stm_mpi_drain()
+                    if multi_pid:
+                        self._stm_drain_incoming(pid)
+                    time.sleep(0.0001)
+                # Tail-drain MPI a few times to catch any final messages.
+                for _ in range(8):
+                    self._stm_mpi_drain()
+                    time.sleep(0.0001)
+                MPI.COMM_WORLD.Barrier()
+                self._stm_mpi_drain()
+                if self._stm_pending_sends:
+                    MPI.Request.Waitall(self._stm_pending_sends)
+                    self._stm_pending_sends = []
+                if multi_pid:
+                    for q_pid in range(1, len(self._local_partitions)):
+                        self._local_data_queues[q_pid].put(('GLOBAL_DONE',))
+            else:
+                # Non-pid-0 in multi-rank: keep draining mp.Queue until
+                # GLOBAL_DONE arrives.
+                while True:
+                    try:
+                        msg = self._local_data_queues[pid].get(timeout=0.001)
+                    except self._queue_empty:
+                        continue
+                    if msg[0] == 'GLOBAL_DONE':
+                        break
+                    self._stm_drain_one_message(msg)
+
+        # Final intra-rank barrier.
+        if multi_pid:
             self._cmb_done_barrier.wait()
             self._stm_drain_incoming(pid)
 
@@ -1131,35 +1191,56 @@ class sync(object):
 
     def _stm_advance_lp(self, sname, horizon):
         """Advance LP sname to horizon; then publish new safe times on
-        each output channel via TS_UPDATE messages on the destination
-        pid's data queue.
+        each output channel.
 
         Correctness via queue ordering: REAL messages on this source's
         outputs were enqueued during sim._run on each destination pid's
-        data queue. The TS_UPDATE we push here arrives AFTER those REALs
-        in FIFO order on the same queue. The destination drains in
-        order: schedules each REAL (its until is at least the source's
-        old front on that channel, so sched succeeds), then the
-        TS_UPDATE raises the channel's front to the new safe time.
+        data queue (intra-rank) or via MPI isend (inter-rank). The
+        TS_UPDATE follows REAL on the same FIFO transport, so a
+        destination drains REALs first (and sched succeeds: their until
+        is at least the source's old front), then raises the channel's
+        front via TS_UPDATE.
         """
         sim = self._local_sims[sname]
         sim._run(horizon, True)
         end_now = sim.now
-        ts_arr = self._channel_ts
-
         for ch_id in self._lp_outputs.get(sname, []):
             ch = self._channels[ch_id]
             new_safe = end_now + ch.min_delay
-            slot = ch.ts_idx
-            if new_safe > ts_arr[slot]:
-                ts_arr[slot] = new_safe
-            dst_pid = self._local_pids.get(ch.dst_name)
-            if dst_pid == self._stm_my_pid:
-                if new_safe > ch.front:
-                    ch.front = new_safe
-            elif dst_pid is not None:
-                self._local_data_queues[dst_pid].put(
-                    ('TS_UPDATE', ch_id, new_safe))
+            self._stm_publish_safe_time(ch_id, new_safe)
+
+    def _stm_publish_safe_time(self, ch_id, safe_time):
+        """Publish a new safe-time guarantee to the destination of ch_id.
+
+        Intra-pid: write directly to channel.front.
+        Inter-pid (same rank): enqueue TS_UPDATE on dst pid's data queue
+                               (FIFO-ordered with REAL).
+        Inter-rank: pid 0 issues MPI isend; other pids forward via the
+                    MPI_OUT_TS_UPDATE trampoline on pid 0's queue.
+        Mirrors _cmb_publish_safe_time. The shared-memory _channel_ts
+        slot is also updated (intra-rank reads use ch.front, but the
+        mirror keeps the slot consistent for any future reader).
+        """
+        ch = self._channels[ch_id]
+        slot = ch.ts_idx
+        ts_arr = self._channel_ts
+        if safe_time > ts_arr[slot]:
+            ts_arr[slot] = safe_time
+        dst_pid = self._local_pids.get(ch.dst_name)
+        if dst_pid is None:
+            target_rank = self._all_sims[ch.dst_name]
+            if self._stm_my_pid == 0:
+                self._stm_mpi_isend_ts(target_rank, ch_id, safe_time)
+            else:
+                self._local_data_queues[0].put(
+                    ('MPI_OUT_TS_UPDATE', target_rank, ch_id, safe_time))
+            return
+        if dst_pid == self._stm_my_pid:
+            if safe_time > ch.front:
+                ch.front = safe_time
+        else:
+            self._local_data_queues[dst_pid].put(
+                ('TS_UPDATE', ch_id, safe_time))
 
     def _stm_drain_incoming(self, pid):
         """Non-blocking drain of this pid's mp.Queue for REAL messages."""
@@ -1178,12 +1259,21 @@ class sync(object):
         self._stm_drain_one_message(msg)
 
     def _stm_drain_one_message(self, msg):
-        """Process a single message from the data queue. STM has two
-        kinds: REAL (a forwarded inter-LP message) and TS_BATCH (a
-        bundled safe-time publication from one source). FIFO ordering
-        on the queue is what makes this protocol correct: any TS_BATCH
-        from source S to dest pid D arrives AFTER every REAL S sent on
-        any channel to D in the same advance."""
+        """Process a single message from the data queue.
+
+        Intra-rank kinds:
+          REAL       a forwarded inter-LP message (-> sched)
+          TS_UPDATE  a safe-time publication on a channel (-> ch.front)
+        MPI trampoline kinds (non-pid-0 pushes; pid 0 fires the MPI):
+          MPI_OUT_REAL       -> _stm_mpi_isend_real
+          MPI_OUT_TS_UPDATE  -> _stm_mpi_isend_ts
+          GLOBAL_DONE        sentinel from pid 0 closing termination
+
+        FIFO ordering on each per-pid queue is what makes the protocol
+        correct: any TS_UPDATE from source S to dest pid D arrives
+        AFTER every REAL S sent on any channel to D in the same advance,
+        so D drains all REAL_S first.
+        """
         kind = msg[0]
         if kind == 'REAL':
             _, _src_name, mb_name, part, payload, until = msg
@@ -1194,21 +1284,118 @@ class sync(object):
             ch = self._channels.get(ch_id)
             if ch is not None and new_safe > ch.front:
                 ch.front = new_safe
+        elif kind == 'MPI_OUT_REAL':
+            _, target_rank, src_name, mb_name, part, payload, until = msg
+            self._stm_mpi_isend_real(
+                target_rank, src_name, mb_name, part, payload, until)
+        elif kind == 'MPI_OUT_TS_UPDATE':
+            _, target_rank, ch_id, safe_time = msg
+            self._stm_mpi_isend_ts(target_rank, ch_id, safe_time)
+        elif kind == 'GLOBAL_DONE':
+            # Sent by pid 0 to non-pid-0 workers in multi-rank
+            # termination; the post-Iallreduce barrier handles
+            # the actual rendezvous, this just exits the wait loop.
+            pass
         else:
             raise RuntimeError("unknown STM message kind: %r" % (kind,))
 
+    # ---------- MPI transport (pid 0 only) ----------
+
+    def _stm_mpi_isend_ts(self, target_rank, ch_id, safe_time):
+        """Non-blocking MPI send of a TS_UPDATE. Mirrors
+        _cmb_mpi_isend_null but on _STM_TS_TAG and with channel-id
+        payload."""
+        from mpi4py import MPI
+        payload = (ch_id, safe_time)
+        req = MPI.COMM_WORLD.isend(
+            payload, dest=target_rank, tag=_STM_TS_TAG)
+        self._stm_pending_sends.append(req)
+
+    def _stm_mpi_isend_real(self, target_rank, src_name, mb_name,
+                             part, msg, until):
+        """Non-blocking MPI send of a REAL message. Mirrors
+        _cmb_mpi_isend_real but on _STM_REAL_TAG."""
+        from mpi4py import MPI
+        payload = (src_name, mb_name, part, msg, until)
+        req = MPI.COMM_WORLD.isend(
+            payload, dest=target_rank, tag=_STM_REAL_TAG)
+        self._stm_pending_sends.append(req)
+
+    def _stm_mpi_prune_pending(self):
+        """Periodic prune of completed isend requests. pid 0 only."""
+        if not self._stm_pending_sends:
+            return
+        self._stm_pending_sends = [
+            r for r in self._stm_pending_sends if not r.Test()
+        ]
+
+    def _stm_mpi_drain(self):
+        """pid 0 only: drain all pending incoming MPI messages, routing
+        TS_UPDATE / REAL to the appropriate local pid (or applying
+        directly if the destination LP is on pid 0). Non-blocking;
+        returns when no more incoming messages are pending."""
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        status = MPI.Status()
+        while comm.iprobe(source=MPI.ANY_SOURCE,
+                          tag=MPI.ANY_TAG,
+                          status=status):
+            tag = status.Get_tag()
+            source = status.Get_source()
+            if tag == _STM_TS_TAG:
+                payload = comm.recv(source=source, tag=tag)
+                ch_id, safe_time = payload
+                ch = self._channels.get(ch_id)
+                if ch is None:
+                    continue
+                target_pid = self._local_pids.get(ch.dst_name)
+                if target_pid == 0:
+                    if safe_time > ch.front:
+                        ch.front = safe_time
+                    slot = ch.ts_idx
+                    if safe_time > self._channel_ts[slot]:
+                        self._channel_ts[slot] = safe_time
+                elif target_pid is not None:
+                    self._local_data_queues[target_pid].put(
+                        ('TS_UPDATE', ch_id, safe_time))
+            elif tag == _STM_REAL_TAG:
+                payload = comm.recv(source=source, tag=tag)
+                src_name, mb_name, part, msg, until = payload
+                target_sname = self._all_mboxes[mb_name][0]
+                target_pid = self._local_pids.get(target_sname)
+                if target_pid == 0:
+                    mb = self._local_mboxes[mb_name]
+                    mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+                elif target_pid is not None:
+                    self._local_data_queues[target_pid].put(
+                        ('REAL', src_name, mb_name, part, msg, until))
+            else:
+                comm.recv(source=source, tag=tag)
+                log.warning("[r%d] STM: unknown MPI tag %d, dropped" %
+                            (sync._simulus.comm_rank, tag))
+
     def _stm_route_send(self, sim, mbox_name, msg, part, until):
-        """STM-specific send routing. Carries REAL messages on the same
-        per-pid mp.Queue as the TS_BATCH publishes; the FIFO ordering of
-        REALs sent during an advance with the TS_BATCH posted after the
-        advance is what guarantees the destination cannot advance past
-        an undelivered REAL. SPMD path is unimplemented in this stage."""
+        """STM-specific send routing. Mirrors _cmb_route_send.
+
+        Routing tiers:
+          intra-pid: schedule directly on receiver's mailbox
+          inter-pid (same rank): mp.Queue on target pid (FIFO with the
+                                 TS_UPDATE that follows in the advance)
+          inter-rank: pid 0 issues MPI isend; other pids forward via
+                      the MPI_OUT_REAL trampoline on pid 0's queue
+        """
         sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
         target_pid = self._local_pids.get(sname)
         if target_pid is None:
-            raise NotImplementedError(
-                "STM under enable_spmd is not implemented in this stage; "
-                "cross-rank send to '%s' refused" % sname)
+            target_rank = self._all_sims[sname]
+            if self._stm_my_pid == 0:
+                self._stm_mpi_isend_real(
+                    target_rank, sim.name, mbox_name, part, msg, until)
+            else:
+                self._local_data_queues[0].put(
+                    ('MPI_OUT_REAL', target_rank, sim.name, mbox_name,
+                     part, msg, until))
+            return True
         if target_pid == self._stm_my_pid:
             mb = self._local_mboxes[mbox_name]
             mb._sim.sched(mb._mailbox_event, msg, part, until=until)
