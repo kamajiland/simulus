@@ -365,9 +365,18 @@ class sync(object):
         # double precision. Allocated as mp.RawArray so SMP children
         # inherit a single backing buffer through fork; works equivalently
         # in single-process mode. ts_idx records each channel's slot.
+        #
+        # Also allocate per-channel send/drain counters for the
+        # snapshot-consistency check in _stm_compute_horizon. These are
+        # SPSC by construction: send_count[c] is written only by the
+        # source pid of channel c (after each REAL queue.put);
+        # drain_count[c] is written only by the destination pid (after
+        # each REAL drain). Plain RawArray writes suffice on x86 TSO.
         if self._protocol == 'stm':
             n_ch = len(self._channels)
             self._channel_ts = mp.RawArray(ctypes.c_double, n_ch)
+            self._stm_send_count = mp.RawArray(ctypes.c_uint64, n_ch)
+            self._stm_drain_count = mp.RawArray(ctypes.c_uint64, n_ch)
             for i, (ch_id, ch) in enumerate(self._channels.items()):
                 ch.ts_idx = i
                 self._channel_ts[i] = ch.front
@@ -1172,19 +1181,52 @@ class sync(object):
                  (sync._simulus.comm_rank, pid))
 
     def _stm_compute_horizon(self, sname, upper):
-        """STM advance check: read all input channels' fronts as a single
-        snapshot, take the minimum, bound by upper. The ts[] shared array
-        mirrors front for inter-rank reads (future work); here we read
-        from the per-_Channel front field, which is updated by the
-        TS_UPDATE drain in queue-FIFO order with REAL messages on the
-        same source->dest path."""
+        """STM advance check (paper Algorithm 1): atomic snapshot of all
+        input channel timestamps from shared memory.
+
+        The snapshot reads `_channel_ts[c.ts_idx]` for every input
+        channel c of LP sname --- a tight memory loop, no queue
+        operations. To guard against a race where a source has queued
+        a REAL on an input channel but its corresponding ts[] update
+        is not yet visible (or vice versa), we check the per-channel
+        send/drain counters: if any input has send_count != drain_count
+        a REAL is in flight; we drain the queue and retry the snapshot.
+        This is the paper's transactional `retry` semantics --- aborts
+        are productive because the retry sees the higher ts[] from
+        whatever source just published.
+
+        Termination of the retry loop: each iteration drains the queue,
+        which monotonically raises drain_count. send_count is also
+        monotonic. The loop exits as soon as drain_count catches up
+        on every input. Under steady operation (no source actively
+        publishing on this LP's inputs in the gap between drain and
+        snapshot), the first iteration succeeds.
+        """
         inputs = self._lp_inputs.get(sname, [])
         if not inputs:
             return upper
-        h = min(self._channels[ch_id].front for ch_id in inputs)
-        if h > upper:
+        ts_arr = self._channel_ts
+        send_arr = self._stm_send_count
+        drain_arr = self._stm_drain_count
+        while True:
+            # Snapshot ts[] for all inputs.
             h = upper
-        return h
+            for ch_id in inputs:
+                slot = self._channels[ch_id].ts_idx
+                t = ts_arr[slot]
+                if t < h:
+                    h = t
+            # Consistency: any in-flight REAL on these channels?
+            any_pending = False
+            for ch_id in inputs:
+                slot = self._channels[ch_id].ts_idx
+                if send_arr[slot] != drain_arr[slot]:
+                    any_pending = True
+                    break
+            if not any_pending:
+                return h
+            # Retry: drain mp.Queue (advances drain_count) and re-snapshot.
+            self._stm_drain_incoming(self._stm_my_pid)
 
     def _stm_advance_lp(self, sname, horizon):
         """Advance LP sname to horizon; then publish new safe times on
@@ -1209,35 +1251,37 @@ class sync(object):
     def _stm_publish_safe_time(self, ch_id, safe_time):
         """Publish a new safe-time guarantee to the destination of ch_id.
 
-        Intra-pid: write directly to channel.front.
-        Inter-pid (same rank): enqueue TS_UPDATE on dst pid's data queue
-                               (FIFO-ordered with REAL).
-        Inter-rank: pid 0 issues MPI isend; other pids forward via the
-                    MPI_OUT_TS_UPDATE trampoline on pid 0's queue.
-        Mirrors _cmb_publish_safe_time. The shared-memory _channel_ts
-        slot is also updated (intra-rank reads use ch.front, but the
-        mirror keeps the slot consistent for any future reader).
+        v3: intra-rank publish is a single shared-memory write. There
+        is no per-channel queue message accompanying it (compare CMB,
+        which dispatches a NULL on every output channel per advance).
+        This is the structural change that makes STM's per-advance
+        publish cost O(N_out) memory writes instead of O(N_out) queue
+        puts --- and the corresponding read O(N_in) memory loads
+        instead of O(N_in) queue gets. The cost-model crossover at
+        high fan-in (paper Section 5) is realized here.
+
+        Inter-rank: shared memory does not span ranks, so we still
+        issue MPI TS_UPDATE messages. pid 0 issues the isend directly;
+        other pids trampoline via pid 0's queue.
         """
         ch = self._channels[ch_id]
         slot = ch.ts_idx
         ts_arr = self._channel_ts
+        # Single shared-memory write. Monotonic guard: only raise the
+        # slot, never lower it. Source pid is the sole writer of this
+        # slot (channel is directed: one source LP -> one ts[] slot).
         if safe_time > ts_arr[slot]:
             ts_arr[slot] = safe_time
         dst_pid = self._local_pids.get(ch.dst_name)
         if dst_pid is None:
+            # Inter-rank: still need an MPI message (no shared memory
+            # across nodes).
             target_rank = self._all_sims[ch.dst_name]
             if self._stm_my_pid == 0:
                 self._stm_mpi_isend_ts(target_rank, ch_id, safe_time)
             else:
                 self._local_data_queues[0].put(
                     ('MPI_OUT_TS_UPDATE', target_rank, ch_id, safe_time))
-            return
-        if dst_pid == self._stm_my_pid:
-            if safe_time > ch.front:
-                ch.front = safe_time
-        else:
-            self._local_data_queues[dst_pid].put(
-                ('TS_UPDATE', ch_id, safe_time))
 
     def _stm_drain_incoming(self, pid):
         """Non-blocking drain of this pid's mp.Queue for REAL messages."""
@@ -1250,37 +1294,65 @@ class sync(object):
             self._stm_drain_one_message(msg)
 
     def _stm_wait_for_incoming(self, pid):
-        """Block until at least one REAL message arrives, then process it."""
-        q = self._local_data_queues[pid]
-        msg = q.get()
-        self._stm_drain_one_message(msg)
+        """Brief poll for a REAL or any ts[] update.
+
+        v3 sends intra-rank ts updates through shared memory, not the
+        data queue --- so a blocking q.get() would miss them. We poll
+        the queue with a tiny timeout, returning either when a REAL
+        arrives (drained immediately) or when the timeout expires
+        (the outer loop then re-snapshots ts[] for new fronts).
+        """
+        try:
+            msg = self._local_data_queues[pid].get(timeout=0.0001)
+            self._stm_drain_one_message(msg)
+        except self._queue_empty:
+            pass
 
     def _stm_drain_one_message(self, msg):
         """Process a single message from the data queue.
 
         Intra-rank kinds:
-          REAL       a forwarded inter-LP message (-> sched)
-          TS_UPDATE  a safe-time publication on a channel (-> ch.front)
+          REAL       a forwarded inter-LP message (-> sched, drain++)
+          TS_UPDATE  cross-rank ts publication forwarded by pid 0 to
+                     a non-pid-0 worker; v3 does not use TS_UPDATE
+                     intra-rank (those go via shared memory).
         MPI trampoline kinds (non-pid-0 pushes; pid 0 fires the MPI):
           MPI_OUT_REAL       -> _stm_mpi_isend_real
           MPI_OUT_TS_UPDATE  -> _stm_mpi_isend_ts
           GLOBAL_DONE        sentinel from pid 0 closing termination
 
-        FIFO ordering on each per-pid queue is what makes the protocol
-        correct: any TS_UPDATE from source S to dest pid D arrives
-        AFTER every REAL S sent on any channel to D in the same advance,
-        so D drains all REAL_S first.
+        v3 correctness rests on (1) shared-memory ts[] reads in
+        _stm_compute_horizon and (2) per-channel send/drain counters:
+        when a destination snapshots ts[] and finds send_count[c] !=
+        drain_count[c] for some input c, a REAL is in flight on that
+        channel and the snapshot is retried after another drain. This
+        replaces the FIFO TS_UPDATE-after-REAL invariant of v2.
         """
         kind = msg[0]
         if kind == 'REAL':
-            _, _src_name, mb_name, part, payload, until = msg
+            _, src_name, mb_name, part, payload, until = msg
             mb = self._local_mboxes[mb_name]
             mb._sim.sched(mb._mailbox_event, payload, part, until=until)
+            # Increment drain_count[c] for this channel. Destination pid
+            # is the only writer for its channels' drain_counts, so a
+            # plain RawArray write suffices. <init> bootstrap REALs and
+            # any REAL whose source was not declared as a channel get
+            # ch=None and are skipped (they are not paired with a
+            # send_count++ either).
+            ch_id = (src_name, mb_name)
+            ch = self._channels.get(ch_id)
+            if ch is not None:
+                self._stm_drain_count[ch.ts_idx] += 1
         elif kind == 'TS_UPDATE':
+            # Reached only via MPI trampoline (pid 0 forwarding to a
+            # non-pid-0 worker after _stm_mpi_drain receives a TS_TAG).
+            # Apply directly to shared memory.
             _, ch_id, new_safe = msg
             ch = self._channels.get(ch_id)
-            if ch is not None and new_safe > ch.front:
-                ch.front = new_safe
+            if ch is not None:
+                slot = ch.ts_idx
+                if new_safe > self._channel_ts[slot]:
+                    self._channel_ts[slot] = new_safe
         elif kind == 'MPI_OUT_REAL':
             _, target_rank, src_name, mb_name, part, payload, until = msg
             self._stm_mpi_isend_real(
@@ -1376,8 +1448,14 @@ class sync(object):
 
         Routing tiers:
           intra-pid: schedule directly on receiver's mailbox
-          inter-pid (same rank): mp.Queue on target pid (FIFO with the
-                                 TS_UPDATE that follows in the advance)
+          inter-pid (same rank): mp.Queue on target pid; v3 uses shared
+                                 memory only for ts updates, so the
+                                 source increments _stm_send_count[c]
+                                 after the REAL is enqueued. The
+                                 destination's snapshot-consistency
+                                 check (_stm_compute_horizon) detects
+                                 in-flight REALs via send/drain counter
+                                 mismatch and retries until quiesced.
           inter-rank: pid 0 issues MPI isend; other pids forward via
                       the MPI_OUT_REAL trampoline on pid 0's queue
         """
@@ -1399,6 +1477,15 @@ class sync(object):
         else:
             self._local_data_queues[target_pid].put(
                 ('REAL', sim.name, mbox_name, part, msg, until))
+            # Increment send_count AFTER queue.put. Source pid is the
+            # only writer for this channel's send_count, so a plain
+            # RawArray write is sufficient. Destination's consistency
+            # check reads send_count and retries until drain_count
+            # catches up.
+            ch_id = (sim.name, mbox_name)
+            ch = self._channels.get(ch_id)
+            if ch is not None:
+                self._stm_send_count[ch.ts_idx] += 1
         return True
 
     def _smp_run_lockstep(self, pid, upper, upper_specified):
