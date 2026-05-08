@@ -601,11 +601,19 @@ class sync(object):
             for s in range(1, len(self._local_partitions)):
                 self._local_queues[s].put(0)               # run command
                 self._local_queues[s].put((upper, upper_specified))
-            # Initial messages dispatched via g.send() before g.run() landed in
-            # _remote_msgbuf (the legacy CTW buffer). Drain those into per-pid
-            # data queues (intra-rank) or via MPI isend (cross-rank). We use
-            # '<init>' as a sentinel src_name; the drain ignores src_name for
-            # REAL messages (channel fronts are only updated by NULL messages).
+
+        # Drain initial messages dispatched via g.send() before g.run().
+        # They landed in _remote_msgbuf (the legacy CTW buffer); we route
+        # each into the CMB transport: a local LP gets sched() directly,
+        # an LP on another local pid gets a REAL on its data queue, an LP
+        # on another rank gets an MPI isend. '<init>' is a sentinel
+        # src_name; REAL drain ignores src_name (channel fronts move only
+        # via NULL).
+        # Must run for any pid==0, including the multi_pid==False (one
+        # pid per rank, SPMD-only) case --- otherwise initial cross-rank
+        # messages stay buffered in _remote_msgbuf forever and the
+        # downstream LPs starve.
+        if pid == 0:
             for _rank, msgs in self._remote_msgbuf.items():
                 for (until, mb_name, part, msg) in msgs:
                     target_sname, _md, _np, _src = self._all_mboxes[mb_name]
