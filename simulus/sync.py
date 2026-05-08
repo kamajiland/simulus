@@ -367,11 +367,11 @@ class sync(object):
         # in single-process mode. ts_idx records each channel's slot.
         #
         # Also allocate per-channel send/drain counters for the
-        # snapshot-consistency check in _stm_compute_horizon. These are
-        # SPSC by construction: send_count[c] is written only by the
-        # source pid of channel c (after each REAL queue.put);
-        # drain_count[c] is written only by the destination pid (after
-        # each REAL drain). Plain RawArray writes suffice on x86 TSO.
+        # snapshot-consistency check in _stm_compute_horizon. SPSC by
+        # construction: send_count[c] is written only by the source pid
+        # of channel c (after each REAL queue.put); drain_count[c] is
+        # written only by the destination pid (after each REAL drain).
+        # Plain RawArray writes suffice on x86 TSO.
         if self._protocol == 'stm':
             n_ch = len(self._channels)
             self._channel_ts = mp.RawArray(ctypes.c_double, n_ch)
@@ -1184,23 +1184,16 @@ class sync(object):
         """STM advance check (paper Algorithm 1): atomic snapshot of all
         input channel timestamps from shared memory.
 
-        The snapshot reads `_channel_ts[c.ts_idx]` for every input
-        channel c of LP sname --- a tight memory loop, no queue
-        operations. To guard against a race where a source has queued
-        a REAL on an input channel but its corresponding ts[] update
-        is not yet visible (or vice versa), we check the per-channel
-        send/drain counters: if any input has send_count != drain_count
-        a REAL is in flight; we drain the queue and retry the snapshot.
-        This is the paper's transactional `retry` semantics --- aborts
-        are productive because the retry sees the higher ts[] from
-        whatever source just published.
-
-        Termination of the retry loop: each iteration drains the queue,
-        which monotonically raises drain_count. send_count is also
-        monotonic. The loop exits as soon as drain_count catches up
-        on every input. Under steady operation (no source actively
-        publishing on this LP's inputs in the gap between drain and
-        snapshot), the first iteration succeeds.
+        Correctness uses per-channel send/drain counters. When the
+        check finds send_count[c] != drain_count[c] for any input c,
+        a REAL is in flight on c -- either truly queued, or visible
+        as send_count++ but not yet flushed by mp.Queue's feeder
+        thread. Either way we drain and retry. The retry is bounded:
+        each iteration's drain monotonically raises drain_count, so
+        the loop exits as soon as the feeder has caught up. When the
+        check passes, every REAL ever sent on every input channel is
+        scheduled in this LP's heap, so advancing to min(ts[c]) is
+        safe (events fire in time order during sim._run).
         """
         inputs = self._lp_inputs.get(sname, [])
         if not inputs:
@@ -1209,14 +1202,12 @@ class sync(object):
         send_arr = self._stm_send_count
         drain_arr = self._stm_drain_count
         while True:
-            # Snapshot ts[] for all inputs.
             h = upper
             for ch_id in inputs:
                 slot = self._channels[ch_id].ts_idx
                 t = ts_arr[slot]
                 if t < h:
                     h = t
-            # Consistency: any in-flight REAL on these channels?
             any_pending = False
             for ch_id in inputs:
                 slot = self._channels[ch_id].ts_idx
@@ -1225,21 +1216,17 @@ class sync(object):
                     break
             if not any_pending:
                 return h
-            # Retry: drain mp.Queue (advances drain_count) and re-snapshot.
             self._stm_drain_incoming(self._stm_my_pid)
 
     def _stm_advance_lp(self, sname, horizon):
         """Advance LP sname to horizon; then publish new safe times on
         each output channel.
 
-        Correctness for the SMP transport rests on FIFO ordering of the
-        per-pid mp.Queue: any REAL enqueued during sim._run is enqueued
-        *before* the TS_UPDATE we publish below, so the destination
-        drains REAL first (sched at `until`) before raising ch.front.
-        Since `until <= sim.now` at any send and `sim.now + min_delay
-        >= sim.now`, the destination cannot advance past `until` before
-        the event has been scheduled. SPMD/MPI ordering between REAL
-        and TS tags is a separate concern; see _stm_mpi_isend_*.
+        Correctness rests on the per-channel send/drain counter
+        consistency check in _stm_compute_horizon (see its docstring).
+        Each REAL queued during sim._run bumps send_count[c]; the
+        destination's snapshot-with-retry ensures it cannot read a
+        stale ts[] without first seeing the matching drain_count++.
         """
         sim = self._local_sims[sname]
         sim._run(horizon, True)
@@ -1322,23 +1309,18 @@ class sync(object):
           GLOBAL_DONE        sentinel from pid 0 closing termination
 
         v3 correctness rests on (1) shared-memory ts[] reads in
-        _stm_compute_horizon and (2) per-channel send/drain counters:
-        when a destination snapshots ts[] and finds send_count[c] !=
-        drain_count[c] for some input c, a REAL is in flight on that
-        channel and the snapshot is retried after another drain. This
-        replaces the FIFO TS_UPDATE-after-REAL invariant of v2.
+        _stm_compute_horizon and (2) the per-channel sent-min cap on
+        ts[c] in _stm_advance_lp. The cap guarantees ts[c] is no
+        higher than the smallest in-flight REAL.until on c, so
+        destinations advancing to ts[c] cannot pass any in-flight
+        message --- the eventual drain always sched(until) with
+        until >= sim.now.
         """
         kind = msg[0]
         if kind == 'REAL':
             _, src_name, mb_name, part, payload, until = msg
             mb = self._local_mboxes[mb_name]
             mb._sim.sched(mb._mailbox_event, payload, part, until=until)
-            # Increment drain_count[c] for this channel. Destination pid
-            # is the only writer for its channels' drain_counts, so a
-            # plain RawArray write suffices. <init> bootstrap REALs and
-            # any REAL whose source was not declared as a channel get
-            # ch=None and are skipped (they are not paired with a
-            # send_count++ either).
             ch_id = (src_name, mb_name)
             ch = self._channels.get(ch_id)
             if ch is not None:
@@ -1448,14 +1430,9 @@ class sync(object):
 
         Routing tiers:
           intra-pid: schedule directly on receiver's mailbox
-          inter-pid (same rank): mp.Queue on target pid; v3 uses shared
-                                 memory only for ts updates, so the
-                                 source increments _stm_send_count[c]
-                                 after the REAL is enqueued. The
-                                 destination's snapshot-consistency
-                                 check (_stm_compute_horizon) detects
-                                 in-flight REALs via send/drain counter
-                                 mismatch and retries until quiesced.
+          inter-pid (same rank): mp.Queue on target pid + send_count++
+                                 (consistency-check signal for the
+                                 destination's snapshot retry)
           inter-rank: pid 0 issues MPI isend; other pids forward via
                       the MPI_OUT_REAL trampoline on pid 0's queue
         """
@@ -1479,9 +1456,8 @@ class sync(object):
                 ('REAL', sim.name, mbox_name, part, msg, until))
             # Increment send_count AFTER queue.put. Source pid is the
             # only writer for this channel's send_count, so a plain
-            # RawArray write is sufficient. Destination's consistency
-            # check reads send_count and retries until drain_count
-            # catches up.
+            # RawArray write suffices. Destination's retry loop reads
+            # send_count and waits until drain_count catches up.
             ch_id = (sim.name, mbox_name)
             ch = self._channels.get(ch_id)
             if ch is not None:
