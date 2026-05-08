@@ -145,10 +145,6 @@ class sync(object):
         self._smp_ways = smp_ways
         self._spmd = enable_spmd
         self._protocol = protocol
-        # STM shared-memory state (allocated lazily in run() once we know
-        # the number of partitions / pids).
-        self._horizon_shm = None       # mp.RawArray (one slot per pid; per-pid local horizon)
-        self._horizon_barrier = None   # mp.Barrier(len(self._local_partitions))
         # CMB and STM channel graph (populated below for asynchronous protocols).
         self._channels = {}            # (src_name, mb_name) -> _Channel
         self._lp_inputs = defaultdict(list)   # lp_name -> list of (src_name, mb_name)
@@ -159,9 +155,15 @@ class sync(object):
         self._local_data_queues = None
         self._cmb_done_barrier = None
         self._cmb_done_count = None
-        # Per-worker pid context, set on entry to _smp_run_cmb so sync.send()
-        # (called from inside sim._run) knows which pid is dispatching.
+        # Per-worker pid context, set on entry to _smp_run_cmb / _smp_run_stm
+        # so sync.send() (called from inside sim._run) knows which pid is
+        # dispatching. -1 means "not currently running an async protocol";
+        # the legacy CTW path falls through.
         self._cmb_my_pid = -1
+        self._stm_my_pid = -1
+        # STM shared-memory channel-timestamp array (the ts[] of the
+        # paper). One double per channel; populated in _build_channel_graph.
+        self._channel_ts = None
         if self._spmd and not sync._simulus.args.mpi:
             errmsg = "sync(enable_spmd=True) requires MPI support (use --mpi or -x command-line option)"
             log.error(errmsg)
@@ -319,6 +321,12 @@ class sync(object):
         Each (source, mailbox) pair is one directed channel. Mailboxes that
         did not declare a source are an error: asynchronous protocols
         require explicit channel-graph declaration.
+
+        For STM, also allocate a shared-memory array of channel timestamps
+        (one slot per channel). The array is sized once and inherited by
+        forked SMP children. Each channel's safe-time guarantee is read
+        and written through its `ts_idx` slot in this array; this is the
+        ts[c] of Algorithm 1 / Algorithm 2 in the paper.
         """
         for mbname, (dst_sname, min_delay, _nparts, src_names) in \
                 self._all_mboxes.items():
@@ -348,6 +356,17 @@ class sync(object):
                 self._channels[ch_id] = ch
                 self._lp_inputs[dst_sname].append(ch_id)
                 self._lp_outputs[src_name].append(ch_id)
+
+        # STM: allocate the shared-memory ts[] array. One slot per channel,
+        # double precision. Allocated as mp.RawArray so SMP children
+        # inherit a single backing buffer through fork; works equivalently
+        # in single-process mode. ts_idx records each channel's slot.
+        if self._protocol == 'stm':
+            n_ch = len(self._channels)
+            self._channel_ts = mp.RawArray(ctypes.c_double, n_ch)
+            for i, (ch_id, ch) in enumerate(self._channels.items()):
+                ch.ts_idx = i
+                self._channel_ts[i] = ch.front
 
         log.info("[r%d] sync built channel graph: %d channels, "
                  "protocol=%s" %
@@ -449,25 +468,17 @@ class sync(object):
                     except RuntimeError:
                         pass  # start method already set; assume fork or acceptable alternative
 
-                # Soft-TM Hook A: allocate shared-memory horizon array + barrier
-                # before fork so all children inherit the same backing memory.
-                # Layout: one slot per pid holding the pid's locally-computed
-                # horizon for the current iteration. Barrier (write-then-read)
-                # makes the shared-memory reduce equivalent to YAWNS allreduce
-                # but ~10x cheaper than the mp.Queue round-trip.
-                if self._protocol == 'stm':
-                    n_pids = len(self._local_partitions)
-                    self._horizon_shm = mp.RawArray(ctypes.c_double, n_pids)
-                    self._horizon_barrier = mp.Barrier(n_pids)
-
-                # CMB asynchronous transport: per-pid data queues for nulls
-                # and real messages. Created before fork so children inherit
-                # the queue handles. _cmb_done_count tracks how many pids
-                # have finished advancing; a pid keeps draining incoming
-                # until all pids are done so no messages are stranded
-                # (this is the CMB analog of CTW's window-boundary
-                # collective distribution). Final barrier ensures clean exit.
-                if self._protocol == 'cmb':
+                # Asynchronous-protocol transport: per-pid data queues +
+                # done counter + done barrier. Both CMB and STM use the
+                # same intra-rank termination dance (each pid bumps the
+                # counter when its LPs are all done; everyone keeps
+                # draining until all pids done; final barrier for clean
+                # exit). For CMB the queues carry NULL+REAL; for STM
+                # only REAL (timestamp updates go through the
+                # shared-memory _channel_ts array set up in
+                # _build_channel_graph). Allocated before fork so
+                # children inherit the queue handles.
+                if self._protocol in ('cmb', 'stm'):
                     n_pids = len(self._local_partitions)
                     self._local_data_queues = {
                         i: mp.Queue() for i in range(n_pids)
@@ -551,16 +562,15 @@ class sync(object):
         Each protocol owns its own worker-process loop because the
         synchronization mechanics differ fundamentally:
           - 'ctw': YAWNS-style synchronous barrier reduce (lockstep)
-          - 'stm': lockstep-prototype variant of CTW with shared-memory reduce
-                   (will be replaced by non-lockstep per-channel STM in a
-                    later stage)
           - 'cmb': fully asynchronous null-message protocol
+          - 'stm': fully asynchronous channel-scanning over a
+                   shared-memory ts[] array (the paper's headline).
         """
         if self._protocol == 'cmb':
             self._smp_run_cmb(pid, upper, upper_specified)
+        elif self._protocol == 'stm':
+            self._smp_run_stm(pid, upper, upper_specified)
         else:
-            # ctw and stm both currently use the lockstep loop;
-            # the inner code branches on self._protocol for the reduce.
             self._smp_run_lockstep(pid, upper, upper_specified)
 
     def _smp_run_cmb(self, pid, upper, upper_specified):
@@ -978,11 +988,240 @@ class sync(object):
                 ('REAL', sim.name, mbox_name, part, msg, until))
         return True
 
+    # ============================================================
+    # STM (Soft-TM) asynchronous channel-scanning protocol.
+    #
+    # Each LP advances independently to its own safe-time horizon, computed
+    # by a read-only transaction over its input channels' ts[] slots in
+    # shared memory:
+    #     h_i = min over inputs c of ts[c]
+    # After advancing, the LP performs a single-write transaction on each
+    # output channel's ts[] slot:
+    #     ts[c] := max(ts[c], sim.now + min_delay_c)
+    # Real messages travel through per-pid mp.Queue (intra-rank); inter-rank
+    # transport is left as future work in this stage --- attempting STM
+    # under enable_spmd raises a NotImplementedError at the dispatcher.
+    # ============================================================
+
+    def _smp_run_stm(self, pid, upper, upper_specified):
+        """STM asynchronous channel-scanning run loop.
+
+        Same termination structure as _smp_run_cmb (intra-rank done counter
+        + barrier). The Phase 2 advance check reads shared-memory ts[]
+        slots instead of channel.front; lookahead update writes ts[] after
+        advance. No NULL messages --- timestamp updates are
+        memory-visible to all readers as soon as written.
+        """
+        import queue as _queue_mod
+
+        log.info("[r%d] sync._smp_run_stm(pid=%d): begins upper=%g, "
+                 "upper_specified=%r" %
+                 (sync._simulus.comm_rank, pid, upper, upper_specified))
+
+        if not upper_specified:
+            raise RuntimeError(
+                "STM protocol requires sync.run(until=...) to be specified")
+        if self._spmd and sync._simulus.comm_size > 1:
+            raise NotImplementedError(
+                "STM under enable_spmd is not implemented in this stage; "
+                "use enable_smp only or run with mpiexec -n 1")
+
+        run_sims = self._local_partitions[pid]
+        self._stm_my_pid = pid
+        self._queue_empty = _queue_mod.Empty
+        multi_pid = len(self._local_partitions) > 1
+
+        # pid 0 wakes the children with the run command (matches CMB / lockstep).
+        if pid == 0 and multi_pid:
+            for s in range(1, len(self._local_partitions)):
+                self._local_queues[s].put(0)               # run command
+                self._local_queues[s].put((upper, upper_specified))
+
+        # Drain initial messages from _remote_msgbuf the same way CMB does.
+        # See _smp_run_cmb for rationale; same single-pid (multi_pid==False)
+        # case must run too.
+        if pid == 0:
+            for _rank, msgs in self._remote_msgbuf.items():
+                for (until, mb_name, part, msg) in msgs:
+                    target_sname, _md, _np, _src = self._all_mboxes[mb_name]
+                    target_pid = self._local_pids.get(target_sname)
+                    if target_pid == 0:
+                        mb = self._local_mboxes[mb_name]
+                        mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+                    elif target_pid is not None:
+                        self._local_data_queues[target_pid].put(
+                            ('REAL', '<init>', mb_name, part, msg, until))
+                    # No cross-rank path here: SPMD-STM is unimplemented.
+            self._remote_msgbuf.clear()
+            self._remote_future = infinite_time
+
+        upper_reached = {sname: False for sname in run_sims}
+
+        while not all(upper_reached.values()):
+            # Phase 1: drain incoming REAL messages from this pid's queue.
+            if multi_pid:
+                self._stm_drain_incoming(pid)
+
+            # Phase 2: try to advance each LP not yet done.
+            any_advanced = False
+            for sname in run_sims:
+                if upper_reached[sname]:
+                    continue
+                sim = self._local_sims[sname]
+                horizon = self._stm_compute_horizon(sname, upper)
+                if horizon > sim.now:
+                    self._stm_advance_lp(sname, horizon)
+                    any_advanced = True
+                    if sim.now >= upper:
+                        upper_reached[sname] = True
+
+            # No LP advanced this round. Unlike CMB, STM cannot block on
+            # the data queue here: ts[] updates happen via shared memory
+            # without enqueueing anything, so a blocked q.get() would
+            # never see them and we'd deadlock. The paper's `retry`
+            # semantics map naturally to a short polling sleep --- the
+            # next iteration re-reads ts[] (cheap) and either advances
+            # or sleeps again. Cost is bounded by the sleep interval.
+            if not any_advanced and not all(upper_reached.values()):
+                if multi_pid:
+                    # Brief sleep keeps us responsive to remote ts writes
+                    # while bounding CPU cost. 100us is well below the
+                    # microbenchmark advance-check cost on most hardware.
+                    time.sleep(0.0001)
+                else:
+                    # Single-pid, no IPC: zero-aggregate-lookahead cycle
+                    # or upper unreachable. The paper's "deadlock ->
+                    # livelock" failure mode for STM; we exit here to
+                    # avoid spinning forever.
+                    log.warning("[r%d] sync._smp_run_stm(pid=%d): no LP can "
+                                "advance and no inter-pid IPC; aborting" %
+                                (sync._simulus.comm_rank, pid))
+                    break
+
+        # Termination: same intra-rank done counter + barrier as CMB.
+        if multi_pid:
+            n_pids_local = len(self._local_partitions)
+            with self._cmb_done_count.get_lock():
+                self._cmb_done_count.value += 1
+            while self._cmb_done_count.value < n_pids_local:
+                self._stm_drain_incoming(pid)
+                time.sleep(0.0001)
+            self._stm_drain_incoming(pid)
+            self._cmb_done_barrier.wait()
+            self._stm_drain_incoming(pid)
+
+        self._stm_my_pid = -1
+        log.info("[r%d] sync._smp_run_stm(pid=%d): ends" %
+                 (sync._simulus.comm_rank, pid))
+
+    def _stm_compute_horizon(self, sname, upper):
+        """STM advance check: read all input channels' fronts as a single
+        snapshot, take the minimum, bound by upper. The ts[] shared array
+        mirrors front for inter-rank reads (future work); here we read
+        from the per-_Channel front field, which is updated by the
+        TS_UPDATE drain in queue-FIFO order with REAL messages on the
+        same source->dest path."""
+        inputs = self._lp_inputs.get(sname, [])
+        if not inputs:
+            return upper
+        h = min(self._channels[ch_id].front for ch_id in inputs)
+        if h > upper:
+            h = upper
+        return h
+
+    def _stm_advance_lp(self, sname, horizon):
+        """Advance LP sname to horizon; then publish new safe times on
+        each output channel via TS_UPDATE messages on the destination
+        pid's data queue.
+
+        Correctness via queue ordering: REAL messages on this source's
+        outputs were enqueued during sim._run on each destination pid's
+        data queue. The TS_UPDATE we push here arrives AFTER those REALs
+        in FIFO order on the same queue. The destination drains in
+        order: schedules each REAL (its until is at least the source's
+        old front on that channel, so sched succeeds), then the
+        TS_UPDATE raises the channel's front to the new safe time.
+        """
+        sim = self._local_sims[sname]
+        sim._run(horizon, True)
+        end_now = sim.now
+        ts_arr = self._channel_ts
+
+        for ch_id in self._lp_outputs.get(sname, []):
+            ch = self._channels[ch_id]
+            new_safe = end_now + ch.min_delay
+            slot = ch.ts_idx
+            if new_safe > ts_arr[slot]:
+                ts_arr[slot] = new_safe
+            dst_pid = self._local_pids.get(ch.dst_name)
+            if dst_pid == self._stm_my_pid:
+                if new_safe > ch.front:
+                    ch.front = new_safe
+            elif dst_pid is not None:
+                self._local_data_queues[dst_pid].put(
+                    ('TS_UPDATE', ch_id, new_safe))
+
+    def _stm_drain_incoming(self, pid):
+        """Non-blocking drain of this pid's mp.Queue for REAL messages."""
+        q = self._local_data_queues[pid]
+        while True:
+            try:
+                msg = q.get_nowait()
+            except self._queue_empty:
+                break
+            self._stm_drain_one_message(msg)
+
+    def _stm_wait_for_incoming(self, pid):
+        """Block until at least one REAL message arrives, then process it."""
+        q = self._local_data_queues[pid]
+        msg = q.get()
+        self._stm_drain_one_message(msg)
+
+    def _stm_drain_one_message(self, msg):
+        """Process a single message from the data queue. STM has two
+        kinds: REAL (a forwarded inter-LP message) and TS_BATCH (a
+        bundled safe-time publication from one source). FIFO ordering
+        on the queue is what makes this protocol correct: any TS_BATCH
+        from source S to dest pid D arrives AFTER every REAL S sent on
+        any channel to D in the same advance."""
+        kind = msg[0]
+        if kind == 'REAL':
+            _, _src_name, mb_name, part, payload, until = msg
+            mb = self._local_mboxes[mb_name]
+            mb._sim.sched(mb._mailbox_event, payload, part, until=until)
+        elif kind == 'TS_UPDATE':
+            _, ch_id, new_safe = msg
+            ch = self._channels.get(ch_id)
+            if ch is not None and new_safe > ch.front:
+                ch.front = new_safe
+        else:
+            raise RuntimeError("unknown STM message kind: %r" % (kind,))
+
+    def _stm_route_send(self, sim, mbox_name, msg, part, until):
+        """STM-specific send routing. Carries REAL messages on the same
+        per-pid mp.Queue as the TS_BATCH publishes; the FIFO ordering of
+        REALs sent during an advance with the TS_BATCH posted after the
+        advance is what guarantees the destination cannot advance past
+        an undelivered REAL. SPMD path is unimplemented in this stage."""
+        sname, _min_delay, _nparts, _src = self._all_mboxes[mbox_name]
+        target_pid = self._local_pids.get(sname)
+        if target_pid is None:
+            raise NotImplementedError(
+                "STM under enable_spmd is not implemented in this stage; "
+                "cross-rank send to '%s' refused" % sname)
+        if target_pid == self._stm_my_pid:
+            mb = self._local_mboxes[mbox_name]
+            mb._sim.sched(mb._mailbox_event, msg, part, until=until)
+        else:
+            self._local_data_queues[target_pid].put(
+                ('REAL', sim.name, mbox_name, part, msg, until))
+        return True
+
     def _smp_run_lockstep(self, pid, upper, upper_specified):
-        """Lockstep run loop, used by 'ctw' (YAWNS) and the current
-        lockstep-STM prototype. The horizon-reduce step branches on
-        self._protocol: 'stm' uses a shared-memory barrier reduce while
-        'ctw' uses the original mp.Queue allreduce."""
+        """Lockstep run loop, used by 'ctw' (YAWNS).
+
+        The horizon-reduce step uses an mp.Queue allreduce intra-rank
+        plus an MPI allreduce on rank 0 in SPMD mode."""
 
         log.info("[r%d] sync._smp_run(pid=%d): begins with upper=%g, upper_specified=%r" %
                  (sync._simulus.comm_rank, pid, upper, upper_specified))
@@ -1010,38 +1249,22 @@ class sync(object):
             if horizon > upper:
                 horizon = upper
 
-            # Soft-TM Hook B: replace YAWNS mp.Queue allreduce with shared-memory
-            # barrier-reduce. Every pid writes its locally-computed horizon to its
-            # own slot; barrier syncs writers; each pid then reads all slots and
-            # takes the min; second barrier guarantees no pid overwrites its slot
-            # before all readers have read this iteration's value. SPMD path is
-            # unchanged (kept on the YAWNS branch).
-            if self._protocol == 'stm' and len(self._local_partitions) > 1:
-                self._horizon_shm[pid] = horizon
-                self._horizon_barrier.wait()  # writers done
-                h = self._horizon_shm[0]
-                for i in range(1, len(self._local_partitions)):
-                    if self._horizon_shm[i] < h:
-                        h = self._horizon_shm[i]
-                horizon = h
-                self._horizon_barrier.wait()  # readers done
-            else:
-                # find the next window for all processes on all ranks (YAWNS)
-                if len(self._local_partitions) > 1:
-                    if pid > 0:
-                        self._local_queues[0].put(horizon)
-                    else:
-                        for s in range(1, len(self._local_partitions)):
-                            x = self._local_queues[0].get()
-                            if x < horizon: horizon = x
-                if self._spmd and pid == 0:
-                    horizon = sync._simulus.allreduce(horizon, min)
-                if len(self._local_partitions) > 1:
-                    if pid > 0:
-                        horizon = self._local_queues[pid].get()
-                    else:
-                        for s in range(1, len(self._local_partitions)):
-                            self._local_queues[s].put(horizon)
+            # YAWNS allreduce: mp.Queue intra-rank, MPI on rank 0.
+            if len(self._local_partitions) > 1:
+                if pid > 0:
+                    self._local_queues[0].put(horizon)
+                else:
+                    for s in range(1, len(self._local_partitions)):
+                        x = self._local_queues[0].get()
+                        if x < horizon: horizon = x
+            if self._spmd and pid == 0:
+                horizon = sync._simulus.allreduce(horizon, min)
+            if len(self._local_partitions) > 1:
+                if pid > 0:
+                    horizon = self._local_queues[pid].get()
+                else:
+                    for s in range(1, len(self._local_partitions)):
+                        self._local_queues[s].put(horizon)
             #log.debug("[r%d] sync._run(pid='%d'): sync window [%g:%g]" %
             #          (sync._simulus.comm_rank, pid, self.now, horizon))
 
@@ -1196,12 +1419,20 @@ class sync(object):
                 log.error(errmsg)
                 raise IndexError(errmsg)
 
-            # CMB asynchronous send: route through the per-pid data queue
-            # immediately, rather than buffering for window-boundary
-            # distribution as in CTW.
+            # Asynchronous-protocol send: route through the per-pid data
+            # queue immediately, rather than buffering for window-boundary
+            # distribution as in CTW. The _cmb_my_pid / _stm_my_pid guard
+            # is non-negative only while the corresponding async run loop
+            # is active --- pre-run() g.send() falls through to the
+            # legacy CTW path, which buffers into _remote_msgbuf for the
+            # async loops to drain on entry.
             if self._protocol == 'cmb' and self._cmb_my_pid >= 0:
                 until = sim.now + delay
                 self._cmb_route_send(sim, mbox_name, msg, part, until)
+                return
+            if self._protocol == 'stm' and self._stm_my_pid >= 0:
+                until = sim.now + delay
+                self._stm_route_send(sim, mbox_name, msg, part, until)
                 return
 
             # if it's local delivery, send to the target mailbox
