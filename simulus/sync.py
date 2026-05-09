@@ -1147,15 +1147,25 @@ class sync(object):
                     if multi_pid:
                         self._stm_drain_incoming(pid)
                     time.sleep(0.0001)
-                # Tail-drain MPI a few times to catch any final messages.
-                for _ in range(8):
-                    self._stm_mpi_drain()
-                    time.sleep(0.0001)
-                MPI.COMM_WORLD.Barrier()
-                self._stm_mpi_drain()
+                # Termination handshake (the order matters):
+                #   1. Waitall on our pending isends -> when this returns,
+                #      every outgoing REAL/TS_UPDATE has been matched or
+                #      eagerly buffered at the peer.
+                #   2. Barrier -> both ranks have completed step 1, so
+                #      ALL in-flight messages from either direction now
+                #      sit in some peer's MPI receive buffer.
+                #   3. Final drain -> consume those buffered messages.
+                # If we drained before Waitall (the previous order), our
+                # peer might Waitall AFTER our final drain, leaving the
+                # last few isends to arrive too late. Symptom: STM tail
+                # events get scheduled at one rank but not the other,
+                # producing a small (~1-3 events) scheduled-count drift
+                # vs CMB/CTW under hybrid SMP+SPMD.
                 if self._stm_pending_sends:
                     MPI.Request.Waitall(self._stm_pending_sends)
                     self._stm_pending_sends = []
+                MPI.COMM_WORLD.Barrier()
+                self._stm_mpi_drain()
                 if multi_pid:
                     for q_pid in range(1, len(self._local_partitions)):
                         self._local_data_queues[q_pid].put(('GLOBAL_DONE',))
