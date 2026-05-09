@@ -1324,7 +1324,16 @@ class sync(object):
             ch_id = (src_name, mb_name)
             ch = self._channels.get(ch_id)
             if ch is not None:
-                self._stm_drain_count[ch.ts_idx] += 1
+                # Only bump drain_count for intra-rank inter-pid REALs.
+                # _stm_route_send bumps send_count[slot] only on the
+                # intra-rank inter-pid path; inter-rank sends skip it
+                # (and the bootstrap '<init>' inserts skip it too).
+                # Bumping drain_count here for an inter-rank-delivered
+                # REAL would leave send_count==0 != drain_count>0 and
+                # cause _stm_compute_horizon's consistency check to
+                # spin forever on every input from a remote rank.
+                if src_name in self._local_pids:
+                    self._stm_drain_count[ch.ts_idx] += 1
         elif kind == 'TS_UPDATE':
             # Reached only via MPI trampoline (pid 0 forwarding to a
             # non-pid-0 worker after _stm_mpi_drain receives a TS_TAG).
