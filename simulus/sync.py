@@ -1038,6 +1038,14 @@ class sync(object):
         self._stm_my_pid = pid
         self._queue_empty = _queue_mod.Empty
         self._stm_pending_sends = []
+        # Inter-rank message counters used by the termination
+        # quiescence collective. _stm_mpi_sent_count is bumped on each
+        # MPI_Isend posting (real or ts); _stm_mpi_recvd_count is
+        # bumped on each iprobe-matched recv. Both are pid-0-only;
+        # fork makes each pid see its own copy, but only pid 0 ever
+        # writes them.
+        self._stm_mpi_sent_count = 0
+        self._stm_mpi_recvd_count = 0
         multi_pid = len(self._local_partitions) > 1
         multi_rank = self._spmd and sync._simulus.comm_size > 1
 
@@ -1132,9 +1140,31 @@ class sync(object):
             if multi_rank and pid == 0:
                 self._stm_mpi_drain()
 
-        # Second: cross-rank Iallreduce.
+        # Second: cross-rank termination handshake.
+        #
+        # Phase A: Iallreduce(local_done, MIN) -- every rank confirms it
+        #          has exited the main loop and the intra-rank done
+        #          counter (so no rank is still generating new MPI
+        #          sends).
+        #
+        # Phase B (the "final round of collective"): quiescence loop.
+        #          Each rank tracks the number of inter-rank MPI
+        #          messages it has issued (_stm_mpi_sent_count) and
+        #          drained (_stm_mpi_recvd_count). We drain once, then
+        #          Iallreduce the (sent, recvd) pair. When global_sent
+        #          == global_recvd, every cross-rank message ever
+        #          issued has been consumed at its destination and
+        #          there are no in-flight messages anywhere.
+        #          Convergence: in the termination phase neither
+        #          counter can decrease and sent_count is fixed (no
+        #          new sends), so global_recvd monotonically rises to
+        #          global_sent in O(1) iterations under any MPI
+        #          implementation. This is more robust than relying on
+        #          Waitall + Barrier ordering, which depends on
+        #          implementation-specific isend completion semantics.
         if multi_rank:
             from mpi4py import MPI
+            import array
             if pid == 0:
                 local_done = bytearray([1])
                 global_done = bytearray([1])
@@ -1147,12 +1177,34 @@ class sync(object):
                     if multi_pid:
                         self._stm_drain_incoming(pid)
                     time.sleep(0.0001)
-                # Tail-drain MPI a few times to catch any final messages.
-                for _ in range(8):
+
+                # Phase B: drain to global quiescence.
+                while True:
                     self._stm_mpi_drain()
-                    time.sleep(0.0001)
-                MPI.COMM_WORLD.Barrier()
-                self._stm_mpi_drain()
+                    if multi_pid:
+                        self._stm_drain_incoming(pid)
+                    local_sr = array.array(
+                        'Q',
+                        [self._stm_mpi_sent_count,
+                         self._stm_mpi_recvd_count])
+                    global_sr = array.array('Q', [0, 0])
+                    req2 = MPI.COMM_WORLD.Iallreduce(
+                        [local_sr, MPI.UINT64_T],
+                        [global_sr, MPI.UINT64_T],
+                        op=MPI.SUM)
+                    while not req2.Test():
+                        self._stm_mpi_drain()
+                        if multi_pid:
+                            self._stm_drain_incoming(pid)
+                        time.sleep(0.0001)
+                    if global_sr[0] == global_sr[1]:
+                        break
+
+                # Pending isends are guaranteed matched at this point
+                # (every send was counted, every recv was counted, and
+                # the counters agree globally). Waitall is a paranoia
+                # cleanup of the request list; should be effectively a
+                # no-op.
                 if self._stm_pending_sends:
                     MPI.Request.Waitall(self._stm_pending_sends)
                     self._stm_pending_sends = []
@@ -1161,7 +1213,9 @@ class sync(object):
                         self._local_data_queues[q_pid].put(('GLOBAL_DONE',))
             else:
                 # Non-pid-0 in multi-rank: keep draining mp.Queue until
-                # GLOBAL_DONE arrives.
+                # GLOBAL_DONE arrives. (pid 0's quiescence loop still
+                # forwards inter-rank arrivals to non-zero pids via
+                # this queue, so we must keep draining throughout.)
                 while True:
                     try:
                         msg = self._local_data_queues[pid].get(timeout=0.001)
@@ -1370,6 +1424,7 @@ class sync(object):
         req = MPI.COMM_WORLD.isend(
             payload, dest=target_rank, tag=_STM_TS_TAG)
         self._stm_pending_sends.append(req)
+        self._stm_mpi_sent_count += 1
 
     def _stm_mpi_isend_real(self, target_rank, src_name, mb_name,
                              part, msg, until):
@@ -1380,6 +1435,7 @@ class sync(object):
         req = MPI.COMM_WORLD.isend(
             payload, dest=target_rank, tag=_STM_REAL_TAG)
         self._stm_pending_sends.append(req)
+        self._stm_mpi_sent_count += 1
 
     def _stm_mpi_prune_pending(self):
         """Periodic prune of completed isend requests. pid 0 only."""
@@ -1402,6 +1458,10 @@ class sync(object):
                           status=status):
             tag = status.Get_tag()
             source = status.Get_source()
+            # Count one inter-rank message received per iprobe match.
+            # Used by the termination quiescence collective to detect
+            # when global_sent == global_recvd (= no in-flight messages).
+            self._stm_mpi_recvd_count += 1
             if tag == _STM_TS_TAG:
                 payload = comm.recv(source=source, tag=tag)
                 ch_id, safe_time = payload
