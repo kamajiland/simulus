@@ -28,13 +28,19 @@ _CMB_REAL_TAG = 4002
 _STM_TS_TAG   = 4003
 _STM_REAL_TAG = 4004
 
-# STM Phase 3 polling interval (seconds). Default 100us; override via
-# the STM_POLL_SEC env var for diagnostic A/B testing of polling cost.
+# STM Phase 3 polling interval (seconds). Default 1ms; override via
+# the STM_POLL_SEC env var. Tuned up from the original 100us after
+# pluto SPMD-at-P=1 diagnostics (benchmarks/diag_stm_spmd.py) showed
+# the 100us default thrashes when smp_ways approaches or exceeds the
+# physical core count: at n=64 smp_ways=64 the wall dropped from 3.6s
+# (100us) to 2.0s (1ms) to 1.3s (10ms). 1ms is a safe default --- no
+# SMP regression at any scale tested, ~1.8x SPMD-mode speedup. Set
+# STM_POLL_SEC=0.0001 to recover the original behavior for A/B runs.
 import os as _os
 try:
-    _STM_POLL_SEC = float(_os.environ.get('STM_POLL_SEC', '0.0001'))
+    _STM_POLL_SEC = float(_os.environ.get('STM_POLL_SEC', '0.001'))
 except (TypeError, ValueError):
-    _STM_POLL_SEC = 0.0001
+    _STM_POLL_SEC = 0.001
 
 
 class _Channel(object):
