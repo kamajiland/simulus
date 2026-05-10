@@ -28,6 +28,14 @@ _CMB_REAL_TAG = 4002
 _STM_TS_TAG   = 4003
 _STM_REAL_TAG = 4004
 
+# STM Phase 3 polling interval (seconds). Default 100us; override via
+# the STM_POLL_SEC env var for diagnostic A/B testing of polling cost.
+import os as _os
+try:
+    _STM_POLL_SEC = float(_os.environ.get('STM_POLL_SEC', '0.0001'))
+except (TypeError, ValueError):
+    _STM_POLL_SEC = 0.0001
+
 
 class _Channel(object):
     """A directed channel from a source LP to a destination mailbox.
@@ -1110,9 +1118,11 @@ class sync(object):
             # publishes that go through _channel_ts directly), so we
             # poll on a short sleep --- the paper's `retry` semantics
             # under mp.Queue + RawArray. Cost bounded by sleep interval.
+            # STM_POLL_SEC env var overrides the default 100us; used by
+            # benchmarks/diag_stm_spmd.py to A/B test the polling cost.
             if not any_advanced and not all(upper_reached.values()):
                 if multi_pid or multi_rank:
-                    time.sleep(0.0001)
+                    time.sleep(_STM_POLL_SEC)
                 else:
                     log.warning("[r%d] sync._smp_run_stm(pid=%d): no LP can "
                                 "advance and no inter-pid/inter-rank IPC; "
